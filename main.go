@@ -31,17 +31,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	bookmarks, err := getBookmarks(*apiToken)
+	bookmarks, err := getBookmarks(*apiToken, *verbose)
 	if err != nil {
 		fmt.Println("Error fetching bookmarks:", err)
 		return
 	}
 
+	processBookmarks(bookmarks, verbose, dryRun, apiToken)
+}
+
+func processBookmarks(bookmarks []Bookmark, verbose *bool, dryRun *bool, apiToken *string) {
 	for _, bookmark := range bookmarks {
 		if *verbose {
 			fmt.Printf("Processing bookmark: %s\n", bookmark.URL)
 		}
 		newURL, err := expandAndCheckURL(bookmark.URL, *verbose, *dryRun)
+
+		if err == nil && newURL != "" && newURL != bookmark.URL {
+			if *verbose {
+				fmt.Printf("Bookmark has been expanded, using the new '%s'\n", newURL)
+			}
+
+			if !*dryRun {
+				err := updateBookmark(*apiToken, bookmark.URL, newURL)
+				if err != nil {
+					fmt.Printf("Error updating bookmark '%s': %v\n", bookmark.URL, err)
+					continue
+				}
+			}
+			fmt.Printf("Updated bookmark: %s -> %s\n", bookmark.URL, newURL)
+		}
+
 		if err != nil {
 			fmt.Printf("Error processing bookmark '%s': %v\n", bookmark.URL, err)
 			if !*dryRun {
@@ -51,23 +71,14 @@ func main() {
 					continue
 				}
 				fmt.Printf("Deleted bookmark: %s\n", bookmark.URL)
+			} else {
+				fmt.Printf("Dry run: Bookmark '%s' would have been deleted\n", bookmark.URL)
 			}
-			continue
-		}
-		if newURL != bookmark.URL && !*dryRun {
-			err := updateBookmark(*apiToken, bookmark.URL, newURL)
-			if err != nil {
-				fmt.Printf("Error updating bookmark '%s': %v\n", bookmark.URL, err)
-				continue
-			}
-			fmt.Printf("Updated bookmark: %s -> %s\n", bookmark.URL, newURL)
-		} else if newURL != bookmark.URL && *dryRun {
-			fmt.Printf("Dry run: Bookmark '%s' would be updated to '%s'\n", bookmark.URL, newURL)
 		}
 	}
 }
 
-func getBookmarks(apiToken string) ([]Bookmark, error) {
+func getBookmarks(apiToken string, verbose bool) ([]Bookmark, error) {
 	resp, err := http.Get(fmt.Sprintf("%sposts/all?auth_token=%s&format=json", pinboardAPIEndpoint, apiToken))
 	if err != nil {
 		return nil, err
@@ -77,6 +88,10 @@ func getBookmarks(apiToken string) ([]Bookmark, error) {
 	var bookmarks []Bookmark
 	if err := json.NewDecoder(resp.Body).Decode(&bookmarks); err != nil {
 		return nil, err
+	}
+
+	if verbose {
+		fmt.Printf("Got %d bookmarks from pinboard.in\n", len(bookmarks))
 	}
 
 	return bookmarks, nil
@@ -95,11 +110,11 @@ func expandAndCheckURL(url string, verbose, dryRun bool) (string, error) {
 	defer expandedResp.Body.Close()
 
 	if expandedResp.StatusCode >= 400 {
-		return "", fmt.Errorf("URL returns non-success status code: %d", expandedResp.StatusCode)
+		return "", fmt.Errorf("expanded URL returns non-success status code: %d", expandedResp.StatusCode)
 	}
 
 	// Check if the url has ")" at the end, fix if needed
-	fixedUrl, err := fixParenthesesSuffix(expandedURL, verbose, dryRun)
+	fixedUrl, err := fixParenthesesSuffix(expandedURL, verbose)
 	if err != nil {
 		return "", err
 	}
@@ -110,11 +125,11 @@ func expandAndCheckURL(url string, verbose, dryRun bool) (string, error) {
 	defer fixedResp.Body.Close()
 
 	if fixedResp.StatusCode >= 400 {
-		return "", fmt.Errorf("URL returns non-success status code: %d", fixedResp.StatusCode)
+		return "", fmt.Errorf("fixed URL returns non-success status code: %d", fixedResp.StatusCode)
 	}
 
 	// Check if the URL redirects to another URL, use the final URL if so
-	redirectedUrl, err := urlRedirects(fixedUrl, verbose, dryRun)
+	redirectedUrl, err := urlRedirects(fixedUrl, verbose)
 	if err != nil {
 		return "", err
 	}
@@ -125,46 +140,41 @@ func expandAndCheckURL(url string, verbose, dryRun bool) (string, error) {
 	defer redirectResp.Body.Close()
 
 	if redirectResp.StatusCode >= 400 {
-		return "", fmt.Errorf("URL returns non-success status code: %d", fixedResp.StatusCode)
+		return "", fmt.Errorf("redirected URL returns non-success status code: %d", fixedResp.StatusCode)
 	}
 
 	return redirectedUrl, nil
 }
 
-func fixParenthesesSuffix(urlString string, verbose, dryRun bool) (string, error) {
-	// Check if URL ends with ")"
-	if strings.HasSuffix(urlString, ")") {
-		// Retry check without ")"
-		updatedURL := strings.TrimSuffix(urlString, ")")
-		if verbose {
-			fmt.Printf("URL '%s' ends with ')', retrying without it.\n", urlString)
-		}
-		resp, err := http.Head(updatedURL)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
+func fixParenthesesSuffix(urlString string, verbose bool) (string, error) {
+	// Check if URL ends with ")", if it doesn't return early
+	if !strings.HasSuffix(urlString, ")") {
+		return urlString, nil
+	}
 
-		// If the updated URL works, return it
-		if resp.StatusCode == http.StatusOK {
-			if !dryRun {
-				if verbose {
-					fmt.Printf("URL updated: '%s' -> '%s'\n", urlString, updatedURL)
-				}
-				return updatedURL, nil
-			} else {
-				if verbose {
-					fmt.Printf("Dry run: URL would be updated to '%s'\n", updatedURL)
-				}
-				return urlString, nil
-			}
+	// Retry check without ")"
+	updatedURL := strings.TrimSuffix(urlString, ")")
+	if verbose {
+		fmt.Printf("URL '%s' ends with ')', retrying without it.\n", urlString)
+	}
+	resp, err := http.Head(updatedURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// If the updated URL works, return it
+	if resp.StatusCode == http.StatusOK {
+		if verbose {
+			fmt.Printf("URL updated: '%s' -> '%s'\n", urlString, updatedURL)
 		}
+		return updatedURL, nil
 	}
 
 	return urlString, nil
 }
 
-func urlRedirects(urlString string, verbose, dryRun bool) (string, error) {
+func urlRedirects(urlString string, verbose bool) (string, error) {
 	resp, err := http.Head(urlString)
 	if err != nil {
 		return "", err
@@ -175,17 +185,10 @@ func urlRedirects(urlString string, verbose, dryRun bool) (string, error) {
 	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
 		redirectURL := resp.Header.Get("Location")
 		if redirectURL != "" {
-			if !dryRun {
-				if verbose {
-					fmt.Printf("URL updated: '%s' -> '%s'\n", urlString, redirectURL)
-				}
-				return redirectURL, nil
-			} else {
-				if verbose {
-					fmt.Printf("Dry run: URL would be updated to '%s'\n", redirectURL)
-				}
-				return urlString, nil
+			if verbose {
+				fmt.Printf("Redirected URL updated: '%s' -> '%s'\n", urlString, redirectURL)
 			}
+			return redirectURL, nil
 		}
 	}
 
@@ -193,13 +196,21 @@ func urlRedirects(urlString string, verbose, dryRun bool) (string, error) {
 }
 
 func expandURL(shortURL string) (string, error) {
-	if strings.HasPrefix(shortURL, "https://bit.ly/") || strings.HasPrefix(shortURL, "http://bit.ly/") {
+	var s = shortURL
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "www.")
+
+	fmt.Printf("-> Prefix removed '%s'\n", s)
+
+	if strings.HasPrefix(s, "bit.ly/") {
 		return unshortenBitly(shortURL)
-	} else if strings.HasPrefix(shortURL, "https://tinyurl.com/") || strings.HasPrefix(shortURL, "http://tinyurl.com/") {
-		return unshortenGeneric(shortURL, "http://tinyurl.com/api-create.php?url=")
-	} else if strings.HasPrefix(shortURL, "https://is.gd/") || strings.HasPrefix(shortURL, "http://is.gd/") {
+	} else if strings.HasPrefix(s, "tinyurl.com/") {
+		return unshortenGeneric(shortURL, "http://tinyurl.com/api-create.php?=url=")
+	} else if strings.HasPrefix(s, "is.gd/") {
 		return unshortenGeneric(shortURL, "https://is.gd/forward.php?format=json&shorturl=")
 	}
+
 	return shortURL, nil
 }
 
