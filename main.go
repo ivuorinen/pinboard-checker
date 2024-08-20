@@ -20,7 +20,13 @@ type Bookmark struct {
 }
 
 func main() {
-	apiToken := flag.String("token", "", "Pinboard API token")
+	apiTokenEnv, apiTokenEnvFound := os.LookupEnv("PINBOARD_API_TOKEN")
+	if !apiTokenEnvFound {
+		apiTokenEnv = ""
+	} else {
+		fmt.Println("Using API token from environment variable PINBOARD_API_TOKEN")
+	}
+	apiToken := flag.String("token", apiTokenEnv, "Pinboard API token")
 	dryRun := flag.Bool("dry-run", false, "Dry run (print actions without modifying bookmarks)")
 	verbose := flag.Bool("verbose", false, "Verbose mode")
 	flag.Parse()
