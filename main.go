@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	pinboardAPIEndpoint = "https://api.pinboard.in/v1/"
+	pinboardAPIEndpoint = "https://api.pinboard.in/v1"
 )
 
 type Bookmark struct {
@@ -79,7 +79,7 @@ func processBookmarks(bookmarks []Bookmark, verbose *bool, dryRun *bool, apiToke
 }
 
 func getBookmarks(apiToken string, verbose bool) ([]Bookmark, error) {
-	resp, err := http.Get(fmt.Sprintf("%sposts/all?auth_token=%s&format=json", pinboardAPIEndpoint, apiToken))
+	resp, err := http.Get(fmt.Sprintf("%s/posts/all?auth_token=%s&format=json", pinboardAPIEndpoint, apiToken))
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +99,7 @@ func getBookmarks(apiToken string, verbose bool) ([]Bookmark, error) {
 
 func expandAndCheckURL(url string, verbose, dryRun bool) (string, error) {
 	// Check for expansion (is the URL a short URL?)
-	expandedURL, err := expandURL(url)
+	expandedURL, err := expandURL(url, verbose)
 	if err != nil {
 		return "", err
 	}
@@ -195,13 +195,15 @@ func urlRedirects(urlString string, verbose bool) (string, error) {
 	return urlString, nil
 }
 
-func expandURL(shortURL string) (string, error) {
+func expandURL(shortURL string, verbose bool) (string, error) {
 	var s = shortURL
 	s = strings.TrimPrefix(s, "https://")
 	s = strings.TrimPrefix(s, "http://")
 	s = strings.TrimPrefix(s, "www.")
 
-	fmt.Printf("-> Prefix removed '%s'\n", s)
+	if verbose {
+		fmt.Printf("-> Prefix removed '%s'\n", s)
+	}
 
 	if strings.HasPrefix(s, "bit.ly/") {
 		return unshortenBitly(shortURL)
@@ -253,10 +255,14 @@ func updateBookmark(apiToken, oldURL, newURL string) error {
 		return deleteBookmark(apiToken, oldURL)
 	}
 
-	resp, err := http.Post(
-		pinboardAPIEndpoint+"posts/add",
-		"application/x-www-form-urlencoded",
-		strings.NewReader(fmt.Sprintf("url=%s&replace=yes&old=%s&auth_token=%s", newURL, oldURL, apiToken)),
+	resp, err := http.Get(
+		fmt.Sprintf(
+			"%s/posts/add?url=%s&replace=yes&old=%s&auth_token=%s",
+			pinboardAPIEndpoint,
+			newURL,
+			oldURL,
+			apiToken,
+		),
 	)
 	if err != nil {
 		fmt.Printf("(!) Error updating bookmark: %v\n", err)
@@ -272,10 +278,13 @@ func updateBookmark(apiToken, oldURL, newURL string) error {
 }
 
 func deleteBookmark(apiToken, url string) error {
-	resp, err := http.Post(
-		pinboardAPIEndpoint+"posts/delete",
-		"application/x-www-form-urlencoded",
-		strings.NewReader(fmt.Sprintf("url=%s&auth_token=%s", url, apiToken)),
+	resp, err := http.Get(
+		fmt.Sprintf(
+			"%s/posts/delete?url=%s&auth_token=%s",
+			pinboardAPIEndpoint,
+			url,
+			apiToken,
+		),
 	)
 	if err != nil {
 		fmt.Printf("(!) Error deleting bookmark: %v\n", err)
