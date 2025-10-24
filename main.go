@@ -6,150 +6,462 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/schollz/progressbar/v3"
+	"golang.org/x/net/html"
 )
 
 const (
-	pinboardAPIEndpoint = "https://api.pinboard.in/v1"
+	ErrClosingBodyMsg = "Error closing response body: %v\n"
+	tokenName         = "PINBOARD_API_TOKEN" //nolint:gosec // Not a credential, just the env var name
 )
+
+var pinboardAPIEndpoint = "https://api.pinboard.in/v1"
 
 type Bookmark struct {
 	Title string `json:"description"`
 	URL   string `json:"href"`
+	Tags  string `json:"tags,omitempty"`
+	Notes string `json:"extended,omitempty"`
 }
 
+var (
+	verbose        bool
+	ciMode         bool
+	skipTitles     bool
+	skipAutoTags   bool
+	rateLimiter    = time.NewTicker(3 * time.Second)
+	rateLimiterMux sync.Mutex
+)
+
 func main() {
-	apiTokenEnv, apiTokenEnvFound := os.LookupEnv("PINBOARD_API_TOKEN")
-	if !apiTokenEnvFound {
-		apiTokenEnv = ""
-	} else {
-		fmt.Println("Using API token from environment variable PINBOARD_API_TOKEN")
-	}
+	// Load .env file if it exists (error is OK if file doesn't exist)
+	_ = godotenv.Load() //nolint:errcheck // .env file is optional
+
+	apiTokenEnv, _ := os.LookupEnv(tokenName)
 	apiToken := flag.String("token", apiTokenEnv, "Pinboard API token")
-	dryRun := flag.Bool("dry-run", false, "Dry run (print actions without modifying bookmarks)")
-	verbose := flag.Bool("verbose", false, "Verbose mode")
+	dryRun := flag.Bool("dry-run", false, "Dry run mode")
+	flag.BoolVar(&verbose, "verbose", false, "Verbose mode")
+	flag.BoolVar(&ciMode, "ci", false, "CI mode (no progress bar or verbose output)")
+	flag.BoolVar(&skipTitles, "skip-titles", false, "Skip fetching titles for bookmarks without them")
+	flag.BoolVar(&skipAutoTags, "skip-auto-tags", false, "Skip auto-tagging bookmarks without tags")
 	flag.Parse()
 
 	if *apiToken == "" {
-		fmt.Println("Please provide a Pinboard API token.")
-		flag.Usage()
+		fmt.Println("Error: API token is required")
 		os.Exit(1)
 	}
 
-	bookmarks, err := getBookmarks(*apiToken, *verbose)
+	bookmarks, err := getBookmarks(*apiToken)
 	if err != nil {
 		fmt.Println("Error fetching bookmarks:", err)
+
 		return
 	}
 
-	processBookmarks(bookmarks, verbose, dryRun, apiToken)
+	processBookmarksParallel(bookmarks, *apiToken, *dryRun)
 }
 
-func processBookmarks(bookmarks []Bookmark, verbose *bool, dryRun *bool, apiToken *string) {
-	for _, bookmark := range bookmarks {
-		if *verbose {
-			fmt.Printf("Processing bookmark: %s\n", bookmark.URL)
-		}
-		newURL, err := expandAndCheckURL(bookmark.URL, *verbose, *dryRun)
-
-		if err == nil && newURL != "" && newURL != bookmark.URL {
-			if *verbose {
-				fmt.Printf("Bookmark has been expanded, using the new '%s'\n", newURL)
-			}
-
-			if !*dryRun {
-				err := updateBookmark(*apiToken, bookmark.URL, newURL)
-				if err != nil {
-					fmt.Printf("Error updating bookmark '%s': %v\n", bookmark.URL, err)
-					continue
-				}
-			}
-			fmt.Printf("Updated bookmark: %s -> %s\n", bookmark.URL, newURL)
-		}
-
-		if err != nil {
-			fmt.Printf("Error processing bookmark '%s': %v\n", bookmark.URL, err)
-			if !*dryRun {
-				err := deleteBookmark(*apiToken, bookmark.URL)
-				if err != nil {
-					fmt.Printf("Error deleting bookmark '%s': %v\n", bookmark.URL, err)
-					continue
-				}
-				fmt.Printf("Deleted bookmark: %s\n", bookmark.URL)
-			} else {
-				fmt.Printf("Dry run: Bookmark '%s' would have been deleted\n", bookmark.URL)
-			}
-		}
+func processBookmark(b Bookmark, apiToken string, dryRun bool) {
+	if verbose {
+		fmt.Printf("Processing: %s\n", b.URL)
 	}
-}
+	newURL, err := expandAndCheckURL(b.URL, verbose)
 
-func getBookmarks(apiToken string, verbose bool) ([]Bookmark, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/posts/all?auth_token=%s&format=json", pinboardAPIEndpoint, apiToken))
+	newTitle := fetchTitleIfNeeded(b, newURL)
+	newTags := fetchTagsIfNeeded(b, apiToken, newURL)
+
 	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		handleBookmarkError(b, apiToken, dryRun)
 
+		return
+	}
+
+	if shouldUpdateBookmark(b, newURL, newTitle, newTags) {
+		performBookmarkUpdate(b, apiToken, newURL, newTitle, newTags, dryRun)
+	}
+}
+
+func shouldUpdateBookmark(b Bookmark, newURL, newTitle, newTags string) bool {
+	urlChanged := newURL != "" && newURL != b.URL
+	titleAdded := newTitle != ""
+	tagsAdded := newTags != ""
+
+	return urlChanged || titleAdded || tagsAdded
+}
+
+func handleBookmarkError(b Bookmark, apiToken string, dryRun bool) {
+	if dryRun {
+		return
+	}
+	if deleteErr := deleteBookmark(apiToken, b.URL); deleteErr == nil && verbose {
+		fmt.Printf("Deleted: %s\n", b.URL)
+	}
+}
+
+func performBookmarkUpdate(b Bookmark, apiToken, newURL, newTitle, newTags string, dryRun bool) {
+	if dryRun {
+		return
+	}
+
+	urlToUpdate := newURL
+	if urlToUpdate == "" {
+		urlToUpdate = b.URL
+	}
+
+	if err := updateBookmark(apiToken, b, urlToUpdate, newTitle, newTags); err != nil {
+		return
+	}
+
+	if !verbose {
+		return
+	}
+
+	if newURL != "" && newURL != b.URL {
+		fmt.Printf("Updated: %s -> %s\n", b.URL, newURL)
+	}
+	if newTitle != "" {
+		fmt.Printf("Added title: %s\n", newTitle)
+	}
+	if newTags != "" {
+		fmt.Printf("Added tags: %s\n", newTags)
+	}
+}
+
+func fetchTitleIfNeeded(b Bookmark, newURL string) string {
+	if skipTitles || strings.TrimSpace(b.Title) != "" {
+		return ""
+	}
+
+	urlToFetch := b.URL
+	if newURL != "" {
+		urlToFetch = newURL
+	}
+
+	fetchedTitle, err := getPageTitle(urlToFetch)
+	if err == nil && fetchedTitle != "" {
+		if verbose {
+			fmt.Printf("Fetched title: %s\n", fetchedTitle)
+		}
+
+		return fetchedTitle
+	}
+
+	return ""
+}
+
+func fetchTagsIfNeeded(b Bookmark, apiToken, newURL string) string {
+	if skipAutoTags || strings.TrimSpace(b.Tags) != "" {
+		return ""
+	}
+
+	urlToFetch := b.URL
+	if newURL != "" {
+		urlToFetch = newURL
+	}
+
+	fetchedTags, err := getSuggestedTags(apiToken, urlToFetch)
+	if err == nil && fetchedTags != "" {
+		if verbose {
+			fmt.Printf("Fetched tags: %s\n", fetchedTags)
+		}
+
+		return fetchedTags
+	}
+
+	return ""
+}
+
+func processBookmarksParallel(bookmarks []Bookmark, apiToken string, dryRun bool) {
+	bar := progressbar.Default(int64(len(bookmarks)))
+	if ciMode {
+		bar = nil
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // limit concurrency
+
+	for _, bookmark := range bookmarks {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(b Bookmark) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if bar != nil {
+				_ = bar.Add(1) //nolint:errcheck // Progress bar errors are non-critical
+			}
+			processBookmark(b, apiToken, dryRun)
+		}(bookmark)
+	}
+	wg.Wait()
+}
+
+func waitForRateLimit() {
+	rateLimiterMux.Lock()
+	defer rateLimiterMux.Unlock()
+	<-rateLimiter.C
+}
+
+// getBookmarks retrieves all bookmarks from Pinboard API.
+// Security Note: Pinboard API requires auth_token in query parameters (not headers).
+// This is a limitation of Pinboard's API design. Tokens may appear in server logs.
+// Always use HTTPS (enforced by Pinboard) and keep tokens secure.
+
+func getBookmarks(apiToken string) ([]Bookmark, error) {
+	waitForRateLimit()
+	resp, err := http.Get(fmt.Sprintf("%s/posts/all?auth_token=%s&format=json",
+		pinboardAPIEndpoint,
+		url.QueryEscape(apiToken)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch bookmarks from Pinboard API: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
 	var bookmarks []Bookmark
 	if err := json.NewDecoder(resp.Body).Decode(&bookmarks); err != nil {
-		return nil, err
-	}
-
-	if verbose {
-		fmt.Printf("Got %d bookmarks from pinboard.in\n", len(bookmarks))
+		return nil, fmt.Errorf("failed to decode bookmarks JSON: %w", err)
 	}
 
 	return bookmarks, nil
 }
 
-func expandAndCheckURL(url string, verbose, dryRun bool) (string, error) {
+// updateBookmark updates a bookmark with a new URL in Pinboard.
+// Security Note: Pinboard API requires auth_token in query parameters (not headers).
+// This is a limitation of Pinboard's API design. Tokens may appear in server logs.
+
+func updateBookmark(apiToken string, b Bookmark, newURL, newTitle, newTags string) error {
+	waitForRateLimit()
+
+	// Use new title if provided, otherwise use existing title
+	titleToUse := b.Title
+	if newTitle != "" {
+		titleToUse = newTitle
+	}
+
+	// Use new tags if provided, otherwise use existing tags
+	tagsToUse := b.Tags
+	if newTags != "" {
+		tagsToUse = newTags
+	}
+	// Convert spaces to commas for Pinboard API
+	tagsToUse = strings.ReplaceAll(tagsToUse, " ", ",")
+
+	req := fmt.Sprintf(
+		"%s/posts/add?url=%s&description=%s&extended=%s&tags=%s&replace=yes&auth_token=%s",
+		pinboardAPIEndpoint,
+		url.QueryEscape(newURL),
+		url.QueryEscape(titleToUse),
+		url.QueryEscape(b.Notes),
+		url.QueryEscape(tagsToUse),
+		url.QueryEscape(apiToken),
+	)
+	resp, err := http.Get(req)
+	if err != nil {
+		return fmt.Errorf("failed to update bookmark via Pinboard API: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("update failed: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// deleteBookmark removes a bookmark from Pinboard.
+// Security Note: Pinboard API requires auth_token in query parameters (not headers).
+// This is a limitation of Pinboard's API design. Tokens may appear in server logs.
+
+func deleteBookmark(apiToken, urlStr string) error {
+	waitForRateLimit()
+	resp, err := http.Get(fmt.Sprintf("%s/posts/delete?url=%s&auth_token=%s",
+		pinboardAPIEndpoint,
+		url.QueryEscape(urlStr),
+		url.QueryEscape(apiToken)))
+	if err != nil {
+		return fmt.Errorf("failed to delete bookmark via Pinboard API: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("delete failed: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// getPageTitle fetches a URL and extracts the <title> tag content.
+// Returns empty string if title cannot be extracted (no fallback).
+func getPageTitle(urlString string) (string, error) {
+	resp, err := http.Get(urlString)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch page for title extraction: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to fetch page: status %d", resp.StatusCode)
+	}
+
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse HTML: %w", err)
+	}
+
+	title := extractTitleFromHTML(doc)
+
+	return strings.TrimSpace(title), nil
+}
+
+func extractTitleFromHTML(node *html.Node) string {
+	if node.Type == html.ElementNode && node.Data == "title" {
+		if node.FirstChild != nil {
+			return node.FirstChild.Data
+		}
+
+		return ""
+	}
+
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if title := extractTitleFromHTML(child); title != "" {
+			return title
+		}
+	}
+
+	return ""
+}
+
+// getSuggestedTags fetches tag suggestions from Pinboard API for a given URL.
+// Returns up to 10 suggested tags plus .autoTagged, comma-separated.
+func getSuggestedTags(apiToken, urlStr string) (string, error) {
+	waitForRateLimit()
+
+	apiURL := fmt.Sprintf("%s/posts/suggest?url=%s&auth_token=%s",
+		pinboardAPIEndpoint,
+		url.QueryEscape(urlStr),
+		url.QueryEscape(apiToken))
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch tag suggestions from Pinboard API: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to get suggestions: status %d", resp.StatusCode)
+	}
+
+	var suggestions []struct {
+		Popular     []string `json:"popular"`
+		Recommended []string `json:"recommended"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&suggestions); err != nil {
+		return "", fmt.Errorf("failed to decode tag suggestions JSON: %w", err)
+	}
+
+	tags := collectTagsFromSuggestions(suggestions)
+
+	return strings.Join(tags, ","), nil
+}
+
+func collectTagsFromSuggestions(suggestions []struct {
+	Popular     []string `json:"popular"`
+	Recommended []string `json:"recommended"`
+}) []string {
+	tagMap := make(map[string]bool)
+	var tags []string
+
+	if len(suggestions) > 0 {
+		for _, tag := range suggestions[0].Popular {
+			if !tagMap[tag] && len(tags) < 10 {
+				tagMap[tag] = true
+				tags = append(tags, tag)
+			}
+		}
+		for _, tag := range suggestions[0].Recommended {
+			if !tagMap[tag] && len(tags) < 10 {
+				tagMap[tag] = true
+				tags = append(tags, tag)
+			}
+		}
+	}
+
+	// Always add .autoTagged tag
+	tags = append(tags, ".autoTagged")
+
+	return tags
+}
+
+func expandAndCheckURL(url string, verbose bool) (string, error) {
 	// Check for expansion (is the URL a short URL?)
 	expandedURL, err := expandURL(url, verbose)
 	if err != nil {
 		return "", err
 	}
-	expandedResp, err := http.Head(expandedURL)
-	if err != nil {
+	if err := validateURLAccessibility(expandedURL, "expanded URL"); err != nil {
 		return "", err
-	}
-	defer expandedResp.Body.Close()
-
-	if expandedResp.StatusCode >= 400 {
-		return "", fmt.Errorf("expanded URL returns non-success status code: %d", expandedResp.StatusCode)
 	}
 
 	// Check if the url has ")" at the end, fix if needed
-	fixedUrl, err := fixParenthesesSuffix(expandedURL, verbose)
+	fixedURL, err := fixParenthesesSuffix(expandedURL, verbose)
 	if err != nil {
 		return "", err
 	}
-	fixedResp, err := http.Head(fixedUrl)
-	if err != nil {
+	if err := validateURLAccessibility(fixedURL, "fixed URL"); err != nil {
 		return "", err
-	}
-	defer fixedResp.Body.Close()
-
-	if fixedResp.StatusCode >= 400 {
-		return "", fmt.Errorf("fixed URL returns non-success status code: %d", fixedResp.StatusCode)
 	}
 
 	// Check if the URL redirects to another URL, use the final URL if so
-	redirectedUrl, err := urlRedirects(fixedUrl, verbose)
+	redirectedURL, err := urlRedirects(fixedURL, verbose)
 	if err != nil {
 		return "", err
 	}
-	redirectResp, err := http.Head(redirectedUrl)
-	if err != nil {
+	if err := validateURLAccessibility(redirectedURL, "redirected URL"); err != nil {
 		return "", err
 	}
-	defer redirectResp.Body.Close()
 
-	if redirectResp.StatusCode >= 400 {
-		return "", fmt.Errorf("redirected URL returns non-success status code: %d", fixedResp.StatusCode)
+	return redirectedURL, nil
+}
+
+func validateURLAccessibility(urlString, context string) error {
+	resp, err := http.Head(urlString)
+	if err != nil {
+		return fmt.Errorf("failed to check %s: %w", context, err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fmt.Printf(ErrClosingBodyMsg, closeErr)
+		}
+	}()
+
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		return fmt.Errorf("%s returns non-success status code: %d", context, resp.StatusCode)
 	}
 
-	return redirectedUrl, nil
+	return nil
 }
 
 func fixParenthesesSuffix(urlString string, verbose bool) (string, error) {
@@ -165,15 +477,20 @@ func fixParenthesesSuffix(urlString string, verbose bool) (string, error) {
 	}
 	resp, err := http.Head(updatedURL)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to check URL without parenthesis: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fmt.Printf(ErrClosingBodyMsg, closeErr)
+		}
+	}()
 
 	// If the updated URL works, return it
 	if resp.StatusCode == http.StatusOK {
 		if verbose {
 			fmt.Printf("URL updated: '%s' -> '%s'\n", urlString, updatedURL)
 		}
+
 		return updatedURL, nil
 	}
 
@@ -181,11 +498,21 @@ func fixParenthesesSuffix(urlString string, verbose bool) (string, error) {
 }
 
 func urlRedirects(urlString string, verbose bool) (string, error) {
-	resp, err := http.Head(urlString)
-	if err != nil {
-		return "", err
+	// Create a client that doesn't follow redirects
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	defer resp.Body.Close()
+	resp, err := client.Head(urlString)
+	if err != nil {
+		return "", fmt.Errorf("failed to check URL for redirects: %w", err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fmt.Printf(ErrClosingBodyMsg, closeErr)
+		}
+	}()
 
 	// If redirected, update the URL
 	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
@@ -194,6 +521,7 @@ func urlRedirects(urlString string, verbose bool) (string, error) {
 			if verbose {
 				fmt.Printf("Redirected URL updated: '%s' -> '%s'\n", urlString, redirectURL)
 			}
+
 			return redirectURL, nil
 		}
 	}
@@ -201,41 +529,50 @@ func urlRedirects(urlString string, verbose bool) (string, error) {
 	return urlString, nil
 }
 
+//goland:noinspection HttpUrlsUsage
 func expandURL(shortURL string, verbose bool) (string, error) {
-	var s = shortURL
-	s = strings.TrimPrefix(s, "https://")
-	s = strings.TrimPrefix(s, "http://")
-	s = strings.TrimPrefix(s, "www.")
+	cleanedURL := shortURL
+	cleanedURL = strings.TrimPrefix(cleanedURL, "https://")
+	cleanedURL = strings.TrimPrefix(cleanedURL, "http://")
+	cleanedURL = strings.TrimPrefix(cleanedURL, "www.")
 
 	if verbose {
-		fmt.Printf("-> Prefix removed '%s'\n", s)
+		fmt.Printf("-> Prefix removed '%s'\n", cleanedURL)
 	}
 
-	if strings.HasPrefix(s, "bit.ly/") {
+	switch {
+	case strings.HasPrefix(cleanedURL, "bit.ly/"):
 		return unshortenBitly(shortURL)
-	} else if strings.HasPrefix(s, "tinyurl.com/") {
+	case strings.HasPrefix(cleanedURL, "tinyurl.com/"):
 		return unshortenGeneric(shortURL, "http://tinyurl.com/api-create.php?=url=")
-	} else if strings.HasPrefix(s, "is.gd/") {
+	case strings.HasPrefix(cleanedURL, "is.gd/"):
 		return unshortenGeneric(shortURL, "https://is.gd/forward.php?format=json&shorturl=")
+	default:
+		return shortURL, nil
 	}
-
-	return shortURL, nil
 }
 
-func unshortenBitly(shortURL string) (string, error) {
+// unshortenBitly is a variable that can be overridden for testing.
+var unshortenBitly = unshortenBitlyImpl
+
+func unshortenBitlyImpl(shortURL string) (string, error) {
 	resp, err := http.Post(
 		"https://api-ssl.bitly.com/v4/expand",
 		"application/json",
 		strings.NewReader(fmt.Sprintf(`{"short_url": "%s"}`, shortURL)),
 	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to expand bit.ly URL: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fmt.Printf(ErrClosingBodyMsg, closeErr)
+		}
+	}()
 
 	var bitlyResp struct{ LongURL string }
 	if err := json.NewDecoder(resp.Body).Decode(&bitlyResp); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decode bit.ly response: %w", err)
 	}
 
 	return bitlyResp.LongURL, nil
@@ -244,63 +581,18 @@ func unshortenBitly(shortURL string) (string, error) {
 func unshortenGeneric(shortURL, apiURL string) (string, error) {
 	resp, err := http.Get(apiURL + shortURL)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to expand short URL: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fmt.Printf(ErrClosingBodyMsg, closeErr)
+		}
+	}()
 
 	longURL, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read URL expansion response: %w", err)
 	}
 
 	return string(longURL), nil
-}
-
-func updateBookmark(apiToken, oldURL, newURL string) error {
-	if newURL == "" {
-		return deleteBookmark(apiToken, oldURL)
-	}
-
-	resp, err := http.Get(
-		fmt.Sprintf(
-			"%s/posts/add?url=%s&replace=yes&old=%s&auth_token=%s",
-			pinboardAPIEndpoint,
-			newURL,
-			oldURL,
-			apiToken,
-		),
-	)
-	if err != nil {
-		fmt.Printf("(!) Error updating bookmark: %v\n", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func deleteBookmark(apiToken, url string) error {
-	resp, err := http.Get(
-		fmt.Sprintf(
-			"%s/posts/delete?url=%s&auth_token=%s",
-			pinboardAPIEndpoint,
-			url,
-			apiToken,
-		),
-	)
-	if err != nil {
-		fmt.Printf("(!) Error deleting bookmark: %v\n", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	return nil
 }
