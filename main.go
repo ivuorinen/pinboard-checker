@@ -31,6 +31,23 @@ type Bookmark struct {
 	Notes string `json:"extended,omitempty"`
 }
 
+type ActionType int
+
+const (
+	ActionNoChange ActionType = iota
+	ActionUpdate
+	ActionDelete
+)
+
+type BookmarkAction struct {
+	Original Bookmark
+	Action   ActionType
+	NewURL   string
+	NewTitle string
+	NewTags  string
+	Error    error
+}
+
 var (
 	verbose        bool
 	ciMode         bool
@@ -51,6 +68,7 @@ func main() {
 	flag.BoolVar(&ciMode, "ci", false, "CI mode (no progress bar or verbose output)")
 	flag.BoolVar(&skipTitles, "skip-titles", false, "Skip fetching titles for bookmarks without them")
 	flag.BoolVar(&skipAutoTags, "skip-auto-tags", false, "Skip auto-tagging bookmarks without tags")
+	workers := flag.Int("workers", 10, "Number of concurrent workers for parallel processing")
 	flag.Parse()
 
 	if *apiToken == "" {
@@ -65,26 +83,47 @@ func main() {
 		return
 	}
 
-	processBookmarksParallel(bookmarks, *apiToken, *dryRun)
+	// Phase 1: Process bookmarks in parallel and collect actions
+	actions := processBookmarksParallel(bookmarks, *apiToken, *workers)
+
+	// Phase 2: Apply collected actions sequentially
+	applyBookmarkActions(actions, *apiToken, *dryRun)
 }
 
-func processBookmark(b Bookmark, apiToken string, dryRun bool) {
+func processBookmark(b Bookmark, apiToken string) BookmarkAction {
 	if verbose {
 		fmt.Printf("Processing: %s\n", b.URL)
 	}
+
 	newURL, err := expandAndCheckURL(b.URL, verbose)
 
 	newTitle := fetchTitleIfNeeded(b, newURL)
 	newTags := fetchTagsIfNeeded(b, apiToken, newURL)
 
+	// If there was an error checking the URL, mark for deletion
 	if err != nil {
-		handleBookmarkError(b, apiToken, dryRun)
-
-		return
+		return BookmarkAction{
+			Original: b,
+			Action:   ActionDelete,
+			Error:    err,
+		}
 	}
 
+	// If there are changes, mark for update
 	if shouldUpdateBookmark(b, newURL, newTitle, newTags) {
-		performBookmarkUpdate(b, apiToken, newURL, newTitle, newTags, dryRun)
+		return BookmarkAction{
+			Original: b,
+			Action:   ActionUpdate,
+			NewURL:   newURL,
+			NewTitle: newTitle,
+			NewTags:  newTags,
+		}
+	}
+
+	// No changes needed
+	return BookmarkAction{
+		Original: b,
+		Action:   ActionNoChange,
 	}
 }
 
@@ -94,44 +133,6 @@ func shouldUpdateBookmark(b Bookmark, newURL, newTitle, newTags string) bool {
 	tagsAdded := newTags != ""
 
 	return urlChanged || titleAdded || tagsAdded
-}
-
-func handleBookmarkError(b Bookmark, apiToken string, dryRun bool) {
-	if dryRun {
-		return
-	}
-	if deleteErr := deleteBookmark(apiToken, b.URL); deleteErr == nil && verbose {
-		fmt.Printf("Deleted: %s\n", b.URL)
-	}
-}
-
-func performBookmarkUpdate(b Bookmark, apiToken, newURL, newTitle, newTags string, dryRun bool) {
-	if dryRun {
-		return
-	}
-
-	urlToUpdate := newURL
-	if urlToUpdate == "" {
-		urlToUpdate = b.URL
-	}
-
-	if err := updateBookmark(apiToken, b, urlToUpdate, newTitle, newTags); err != nil {
-		return
-	}
-
-	if !verbose {
-		return
-	}
-
-	if newURL != "" && newURL != b.URL {
-		fmt.Printf("Updated: %s -> %s\n", b.URL, newURL)
-	}
-	if newTitle != "" {
-		fmt.Printf("Added title: %s\n", newTitle)
-	}
-	if newTags != "" {
-		fmt.Printf("Added tags: %s\n", newTags)
-	}
 }
 
 func fetchTitleIfNeeded(b Bookmark, newURL string) string {
@@ -178,14 +179,19 @@ func fetchTagsIfNeeded(b Bookmark, apiToken, newURL string) string {
 	return ""
 }
 
-func processBookmarksParallel(bookmarks []Bookmark, apiToken string, dryRun bool) {
-	bar := progressbar.Default(int64(len(bookmarks)))
-	if ciMode {
-		bar = nil
+func processBookmarksParallel(bookmarks []Bookmark, apiToken string, workers int) []BookmarkAction {
+	var bar *progressbar.ProgressBar
+	if !ciMode {
+		bar = progressbar.NewOptions(len(bookmarks),
+			progressbar.OptionSetDescription("Processing bookmarks..."),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetWidth(40),
+		)
 	}
 
+	results := make(chan BookmarkAction, len(bookmarks))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10) // limit concurrency
+	sem := make(chan struct{}, workers)
 
 	for _, bookmark := range bookmarks {
 		wg.Add(1)
@@ -193,13 +199,121 @@ func processBookmarksParallel(bookmarks []Bookmark, apiToken string, dryRun bool
 		go func(b Bookmark) {
 			defer wg.Done()
 			defer func() { <-sem }()
+
+			action := processBookmark(b, apiToken)
+			results <- action
+
 			if bar != nil {
 				_ = bar.Add(1) //nolint:errcheck // Progress bar errors are non-critical
 			}
-			processBookmark(b, apiToken, dryRun)
 		}(bookmark)
 	}
-	wg.Wait()
+
+	// Wait for all goroutines to finish and close results channel
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect all results
+	actions := make([]BookmarkAction, 0, len(bookmarks))
+	for action := range results {
+		actions = append(actions, action)
+	}
+
+	return actions
+}
+
+func countActionsToApply(actions []BookmarkAction) int {
+	count := 0
+	for _, action := range actions {
+		if action.Action == ActionUpdate || action.Action == ActionDelete {
+			count++
+		}
+	}
+
+	return count
+}
+
+func applyUpdateAction(action BookmarkAction, apiToken string, dryRun bool) {
+	urlToUpdate := action.NewURL
+	if urlToUpdate == "" {
+		urlToUpdate = action.Original.URL
+	}
+
+	if !dryRun {
+		err := updateBookmark(apiToken, action.Original, urlToUpdate, action.NewTitle, action.NewTags)
+		if err != nil && verbose {
+			fmt.Printf("Error updating %s: %v\n", action.Original.URL, err)
+		}
+	}
+
+	if !verbose {
+		return
+	}
+
+	if action.NewURL != "" && action.NewURL != action.Original.URL {
+		fmt.Printf("Updated: %s -> %s\n", action.Original.URL, action.NewURL)
+	}
+	if action.NewTitle != "" {
+		fmt.Printf("Added title: %s\n", action.NewTitle)
+	}
+	if action.NewTags != "" {
+		fmt.Printf("Added tags: %s\n", action.NewTags)
+	}
+}
+
+func applyDeleteAction(action BookmarkAction, apiToken string, dryRun bool) {
+	if !dryRun {
+		err := deleteBookmark(apiToken, action.Original.URL)
+		if err != nil && verbose {
+			fmt.Printf("Error deleting %s: %v\n", action.Original.URL, err)
+		} else if verbose {
+			fmt.Printf("Deleted: %s\n", action.Original.URL)
+		}
+	} else if verbose {
+		fmt.Printf("Would delete: %s (error: %v)\n", action.Original.URL, action.Error)
+	}
+}
+
+func applyBookmarkActions(actions []BookmarkAction, apiToken string, dryRun bool) {
+	actionsToApply := countActionsToApply(actions)
+
+	if actionsToApply == 0 {
+		if verbose {
+			fmt.Println("No changes to apply")
+		}
+
+		return
+	}
+
+	var bar *progressbar.ProgressBar
+	if !ciMode {
+		bar = progressbar.NewOptions(actionsToApply,
+			progressbar.OptionSetDescription("Applying changes..."),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetWidth(40),
+		)
+	}
+
+	for _, action := range actions {
+		switch action.Action {
+		case ActionUpdate:
+			applyUpdateAction(action, apiToken, dryRun)
+			if bar != nil {
+				_ = bar.Add(1) //nolint:errcheck // Progress bar errors are non-critical
+			}
+
+		case ActionDelete:
+			applyDeleteAction(action, apiToken, dryRun)
+			if bar != nil {
+				_ = bar.Add(1) //nolint:errcheck // Progress bar errors are non-critical
+			}
+
+		case ActionNoChange:
+			// Nothing to do
+		}
+	}
 }
 
 func waitForRateLimit() {
