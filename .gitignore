@@ -1,2 +1,3 @@
 pinboard-checker
 .env
+*.out

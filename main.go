@@ -55,6 +55,12 @@ var (
 	skipAutoTags   bool
 	rateLimiter    = time.NewTicker(3 * time.Second)
 	rateLimiterMux sync.Mutex
+
+	stats = &Statistics{
+		ShortURLsExpanded: make(map[string]int),
+		ShortURLsFailed:   make(map[string]int),
+		StatusCodes:       make(map[string]map[int]int),
+	}
 )
 
 func main() {
@@ -76,7 +82,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	stats.FetchBookmarksStart = time.Now()
 	bookmarks, err := getBookmarks(*apiToken)
+	stats.FetchBookmarksDuration = time.Since(stats.FetchBookmarksStart)
+	stats.TotalBookmarks = len(bookmarks)
+
 	if err != nil {
 		fmt.Println("Error fetching bookmarks:", err)
 
@@ -84,10 +94,22 @@ func main() {
 	}
 
 	// Phase 1: Process bookmarks in parallel and collect actions
+	stats.ProcessingStart = time.Now()
 	actions := processBookmarksParallel(bookmarks, *apiToken, *workers)
+	stats.ProcessingDuration = time.Since(stats.ProcessingStart)
 
 	// Phase 2: Apply collected actions sequentially
+	stats.ApplicationStart = time.Now()
 	applyBookmarkActions(actions, *apiToken, *dryRun)
+	stats.ApplicationDuration = time.Since(stats.ApplicationStart)
+
+	stats.TotalDuration = time.Since(stats.FetchBookmarksStart)
+
+	// Print statistics (unless in CI mode)
+	if !ciMode {
+		fmt.Println() // Blank line before stats
+		stats.Print()
+	}
 }
 
 func processBookmark(b Bookmark, apiToken string) BookmarkAction {
@@ -102,29 +124,38 @@ func processBookmark(b Bookmark, apiToken string) BookmarkAction {
 
 	// If there was an error checking the URL, mark for deletion
 	if err != nil {
-		return BookmarkAction{
+		action := BookmarkAction{
 			Original: b,
 			Action:   ActionDelete,
 			Error:    err,
 		}
+		stats.RecordAction(action)
+
+		return action
 	}
 
 	// If there are changes, mark for update
 	if shouldUpdateBookmark(b, newURL, newTitle, newTags) {
-		return BookmarkAction{
+		action := BookmarkAction{
 			Original: b,
 			Action:   ActionUpdate,
 			NewURL:   newURL,
 			NewTitle: newTitle,
 			NewTags:  newTags,
 		}
+		stats.RecordAction(action)
+
+		return action
 	}
 
 	// No changes needed
-	return BookmarkAction{
+	action := BookmarkAction{
 		Original: b,
 		Action:   ActionNoChange,
 	}
+	stats.RecordAction(action)
+
+	return action
 }
 
 func shouldUpdateBookmark(b Bookmark, newURL, newTitle, newTags string) bool {
@@ -146,6 +177,8 @@ func fetchTitleIfNeeded(b Bookmark, newURL string) string {
 	}
 
 	fetchedTitle, err := getPageTitle(urlToFetch)
+	stats.RecordTitleFetch(err == nil && fetchedTitle != "")
+
 	if err == nil && fetchedTitle != "" {
 		if verbose {
 			fmt.Printf("Fetched title: %s\n", fetchedTitle)
@@ -168,6 +201,8 @@ func fetchTagsIfNeeded(b Bookmark, apiToken, newURL string) string {
 	}
 
 	fetchedTags, err := getSuggestedTags(apiToken, urlToFetch)
+	stats.RecordTagFetch(err == nil && fetchedTags != "")
+
 	if err == nil && fetchedTags != "" {
 		if verbose {
 			fmt.Printf("Fetched tags: %s\n", fetchedTags)
@@ -245,6 +280,8 @@ func applyUpdateAction(action BookmarkAction, apiToken string, dryRun bool) {
 		err := updateBookmark(apiToken, action.Original, urlToUpdate, action.NewTitle, action.NewTags)
 		if err != nil && verbose {
 			fmt.Printf("Error updating %s: %v\n", action.Original.URL, err)
+		} else if err == nil {
+			stats.IncrementUpdates()
 		}
 	}
 
@@ -264,15 +301,27 @@ func applyUpdateAction(action BookmarkAction, apiToken string, dryRun bool) {
 }
 
 func applyDeleteAction(action BookmarkAction, apiToken string, dryRun bool) {
-	if !dryRun {
-		err := deleteBookmark(apiToken, action.Original.URL)
-		if err != nil && verbose {
-			fmt.Printf("Error deleting %s: %v\n", action.Original.URL, err)
-		} else if verbose {
-			fmt.Printf("Deleted: %s\n", action.Original.URL)
+	if dryRun {
+		if verbose {
+			fmt.Printf("Would delete: %s (error: %v)\n", action.Original.URL, action.Error)
 		}
-	} else if verbose {
-		fmt.Printf("Would delete: %s (error: %v)\n", action.Original.URL, action.Error)
+
+		return
+	}
+
+	err := deleteBookmark(apiToken, action.Original.URL)
+	if err != nil {
+		if verbose {
+			fmt.Printf("Error deleting %s: %v\n", action.Original.URL, err)
+		}
+
+		return
+	}
+
+	stats.IncrementDeletions()
+
+	if verbose {
+		fmt.Printf("Deleted: %s\n", action.Original.URL)
 	}
 }
 
@@ -432,6 +481,9 @@ func getPageTitle(urlString string) (string, error) {
 		}
 	}()
 
+	// Record HTTP status code
+	stats.RecordHTTPStatus("title-fetch", resp.StatusCode)
+
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to fetch page: status %d", resp.StatusCode)
 	}
@@ -483,6 +535,9 @@ func getSuggestedTags(apiToken, urlStr string) (string, error) {
 			fmt.Printf("Error closing response body: %v\n", err)
 		}
 	}()
+
+	// Record HTTP status code
+	stats.RecordHTTPStatus("tag-fetch", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to get suggestions: status %d", resp.StatusCode)
@@ -571,6 +626,9 @@ func validateURLAccessibility(urlString, context string) error {
 		}
 	}()
 
+	// Record HTTP status code
+	stats.RecordHTTPStatus("url-validation", resp.StatusCode)
+
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		return fmt.Errorf("%s returns non-success status code: %d", context, resp.StatusCode)
 	}
@@ -601,6 +659,8 @@ func fixParenthesesSuffix(urlString string, verbose bool) (string, error) {
 
 	// If the updated URL works, return it
 	if resp.StatusCode == http.StatusOK {
+		stats.IncrementParenthesesFixed()
+
 		if verbose {
 			fmt.Printf("URL updated: '%s' -> '%s'\n", urlString, updatedURL)
 		}
@@ -632,6 +692,8 @@ func urlRedirects(urlString string, verbose bool) (string, error) {
 	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
 		redirectURL := resp.Header.Get("Location")
 		if redirectURL != "" {
+			stats.IncrementRedirects()
+
 			if verbose {
 				fmt.Printf("Redirected URL updated: '%s' -> '%s'\n", urlString, redirectURL)
 			}
@@ -656,11 +718,20 @@ func expandURL(shortURL string, verbose bool) (string, error) {
 
 	switch {
 	case strings.HasPrefix(cleanedURL, "bit.ly/"):
-		return unshortenBitly(shortURL)
+		result, err := unshortenBitly(shortURL)
+		stats.RecordShortenerExpansion("bitly", err == nil)
+
+		return result, err
 	case strings.HasPrefix(cleanedURL, "tinyurl.com/"):
-		return unshortenGeneric(shortURL, "http://tinyurl.com/api-create.php?=url=")
+		result, err := unshortenGeneric(shortURL, "http://tinyurl.com/api-create.php?=url=")
+		stats.RecordShortenerExpansion("tinyurl", err == nil)
+
+		return result, err
 	case strings.HasPrefix(cleanedURL, "is.gd/"):
-		return unshortenGeneric(shortURL, "https://is.gd/forward.php?format=json&shorturl=")
+		result, err := unshortenGeneric(shortURL, "https://is.gd/forward.php?format=json&shorturl=")
+		stats.RecordShortenerExpansion("isgd", err == nil)
+
+		return result, err
 	default:
 		return shortURL, nil
 	}

@@ -64,18 +64,35 @@ func TestUrlRedirects(t *testing.T) {
 	}
 }
 
+//nolint:paralleltest // Cannot run in parallel - modifies global pinboardAPIEndpoint
 func TestUpdateBookmark_Error(t *testing.T) {
-	t.Parallel()
-	invalidToken := "invalid"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	oldEndpoint := pinboardAPIEndpoint
+	pinboardAPIEndpoint = server.URL
+	defer func() { pinboardAPIEndpoint = oldEndpoint }()
+
 	bookmark := Bookmark{URL: "http://example.com", Title: "t", Notes: "n", Tags: "x y"}
-	err := updateBookmark(invalidToken, bookmark, "http://example.com", "", "")
+	err := updateBookmark("invalid", bookmark, "http://example.com", "", "")
 	if err == nil {
 		t.Error("expected error when updating with invalid token")
 	}
 }
 
+//nolint:paralleltest // Cannot run in parallel - modifies global pinboardAPIEndpoint
 func TestDeleteBookmark_Error(t *testing.T) {
-	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	oldEndpoint := pinboardAPIEndpoint
+	pinboardAPIEndpoint = server.URL
+	defer func() { pinboardAPIEndpoint = oldEndpoint }()
+
 	err := deleteBookmark("invalid", "http://nonexistent.com")
 	if err == nil {
 		t.Error("expected error on delete with invalid token")
