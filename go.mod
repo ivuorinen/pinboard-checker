@@ -1,13 +1,13 @@
 module github.com/ivuorinen/pinboard-checker
 
-go 1.25
+go 1.25.0
 
 toolchain go1.26.0
 
 require (
 	github.com/joho/godotenv v1.5.1
 	github.com/schollz/progressbar/v3 v3.19.0
-	golang.org/x/net v0.50.0
+	golang.org/x/net v0.51.0
 )
 
 require (
