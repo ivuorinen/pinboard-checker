@@ -6,7 +6,7 @@ toolchain go1.26.4
 
 require (
 	github.com/joho/godotenv v1.5.1
-	github.com/schollz/progressbar/v3 v3.19.0
+	github.com/schollz/progressbar/v3 v3.19.1
 	golang.org/x/net v0.56.0
 )
 
