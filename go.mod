@@ -1,8 +1,6 @@
 module github.com/ivuorinen/pinboard-checker
 
-go 1.25.0
-
-toolchain go1.26.4
+go 1.26.5
 
 require (
 	github.com/joho/godotenv v1.5.1
