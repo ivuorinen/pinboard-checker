@@ -13,14 +13,15 @@ A Go tool to check and maintain your [Pinboard](https://pinboard.in) bookmarks b
 
 - **Parallel Processing**: Processes bookmarks concurrently (configurable, default 10 workers)
 - **Rate Limiting**: Respects Pinboard API rate limits (1 request per 3 seconds)
-- **URL Shortener Support**: Expands bit.ly, tinyurl.com, and is.gd URLs
+- **URL Shortener Support**: Expands tinyurl.com and is.gd URLs, and bit.ly when
+  `BITLY_ACCESS_TOKEN` is set. An unexpandable short link is left as-is, never deleted
 - **Dead Link Detection**: Deletes bookmarks only on a definite 4xx (keeps 5xx for retry).
   Timeouts, DNS failures, and non-HTTP schemes are skipped, never deleted
 - **URL Normalization**: Fixes common URL issues like trailing parentheses
 - **Auto-Title Fetching**: Automatically fetches and sets page titles for bookmarks without them
-- **Auto-Tagging**: Adds up to 10 suggested tags (from Pinboard API) for untagged bookmarks,
-  including an `.autoTagged` marker. Pinboard treats tags beginning with a period as
-  private tags
+- **Auto-Tagging**: Adds up to 9 suggested tags (from Pinboard API) plus an
+  `.autoTagged` marker to untagged bookmarks, 10 in total. Pinboard treats tags
+  beginning with a period as private tags
 - **Dry Run Mode**: Test changes without modifying bookmarks
 - **Progress Tracking**: Shows progress bar for batch operations
 - **CI Mode**: Quiet mode for automated environments
@@ -88,6 +89,8 @@ Pinboard's API requires authentication tokens to be passed as URL query paramete
 - This is a limitation of Pinboard's API design, not this tool
 - **Always use HTTPS** (enforced by Pinboard API)
 - The tool URL-encodes all parameters for safety
+- Error messages strip the request URL, so a failed request cannot print your
+  token to stderr or into a CI log
 
 ### Error Handling
 
@@ -139,13 +142,16 @@ pinboard-checker -ci
 
 1. **Fetch Bookmarks**: Retrieves all bookmarks from your Pinboard account
 2. **Process Each Bookmark**:
+   - Skips anything `net/http` cannot dial (`mailto:`, `ftp:`, `file:`,
+     `javascript:` bookmarklets) without touching it
    - Expands shortened URLs (bit.ly, tinyurl.com, is.gd)
-   - Checks if the URL is accessible
-   - Fixes trailing parentheses if needed
+   - Fixes a trailing parenthesis when the URL works without it
    - Follows the redirect chain to its final destination (up to 5 hops)
-   - Validates final URL returns 2xx/3xx status
-   - Fetches page title if bookmark has no title (unless -skip-titles)
-   - Fetches suggested tags if bookmark has no tags (unless -skip-auto-tags)
+   - Checks the **final** URL, and only it: a 4xx marks the bookmark dead,
+     anything else keeps it. The repairs above run first on purpose — their whole
+     point is to turn a URL that fails right now into one that works
+   - Fetches page title if bookmark has no title (unless `-skip-titles`)
+   - Fetches suggested tags if bookmark has no tags (unless `-skip-auto-tags`)
      - Gets up to 9 tags from Pinboard's suggestion API, plus the `.autoTagged`
        marker, for 10 in total
      - If Pinboard suggests nothing, the bookmark is left untouched
@@ -192,6 +198,21 @@ pinboard-checker -skip-titles
 pinboard-checker -skip-auto-tags
 ```
 
+## Statistics
+
+Every run except `-ci` prints a summary: timings, the action breakdown, what
+changed, HTTP status counts per operation, and the API calls performed. Two
+counters are worth knowing:
+
+- **Skipped (unchecked)** — bookmarks left untouched because they could not be
+  verified: an unreachable host, a timeout, or a scheme `net/http` cannot dial.
+  These are never deletion candidates.
+- **Writes rejected** — changes Pinboard refused. This is also what makes the
+  process exit non-zero, and it is printed even under `-ci`.
+
+The report is deterministic: identical counters render identical text, so two
+runs can be diffed against each other.
+
 ## Development
 
 ### Requirements
@@ -218,21 +239,27 @@ needs no network access.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+3. Make your change, keeping `go test -race ./...` and `golangci-lint run` green
+4. Commit using [Conventional Commits](https://www.conventionalcommits.org/)
+   (`fix:`, `feat:`, `docs:`, `chore:`, `ci:`, …), as the existing history does
+5. Push to the branch (`git push origin feature/amazing-feature`)
+6. Open a Pull Request
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+CI runs the build, the test suite under `-race`, and `golangci-lint`. All three
+must pass.
 
 ## API Rate Limiting
 
 This tool respects Pinboard's API rate limit of 1 request per 3 seconds. The rate
 limiter is built-in and ensures compliance even when processing bookmarks in parallel.
 On an HTTP 429 the interval is doubled and the request retried, as Pinboard's API
-documentation requires. Note that `posts/all` has its own limit of one call every
-five minutes, so back-to-back runs may be throttled.
+documentation requires — up to 5 attempts, and never beyond a 60-second ceiling.
+Once requests succeed again the interval halves back toward the 3-second default,
+so a momentary throttle does not slow the rest of the run. If all 5 attempts are
+rejected the run reports a rate-limit error rather than continuing silently.
+
+Note that `posts/all` has its own limit of one call every five minutes, so
+back-to-back runs may be throttled on the very first request.
 
 ## Troubleshooting
 
@@ -242,8 +269,10 @@ Set the `PINBOARD_API_TOKEN` environment variable or pass `-token` flag.
 
 ### Rate limit errors
 
-The tool automatically rate-limits requests. If you see rate limit errors, there may
-be other tools accessing your Pinboard account simultaneously.
+The tool rate-limits itself and backs off automatically on HTTP 429, so occasional
+throttling needs no intervention. Persistent rate limiting usually means another
+client is using the same Pinboard account, or that the run started within five
+minutes of a previous one — `posts/all` allows one call per five minutes.
 
 ### Timeouts
 
@@ -251,3 +280,7 @@ Requests time out after 15 seconds; change this with `-timeout` (for example
 `-timeout 30s`). A timed-out URL is **skipped**, never deleted — only a definite
 4xx response marks a bookmark as dead. Skipped bookmarks are reported in the
 statistics block.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
