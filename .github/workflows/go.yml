@@ -9,6 +9,12 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Least privilege: neither job writes anything back to the repository. Without
+# this block the workflow inherits the repository default, which may grant
+# write access across contents, issues, and packages.
+permissions:
+  contents: read
+
 jobs:
 
   build:
@@ -19,10 +25,31 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
       with:
-        go-version: '1.26'
+        # Follow go.mod rather than a second, separately drifting version pin.
+        go-version-file: go.mod
 
     - name: Build
       run: go build -v ./...
 
+    # -race is not optional here: the whole program is a worker pool sharing one
+    # mutable Statistics, so a race introduced there must fail the build.
     - name: Test
-      run: go test -v ./...
+      run: go test -race -coverprofile=coverage.out ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      with:
+        go-version-file: go.mod
+
+    - name: Lint
+      uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v2.12.2
+        # --fix=false overrides `issues.fix: true` in .golangci.yml. Without it
+        # CI would rewrite the checkout and then lint its own output.
+        args: --timeout 5m --fix=false

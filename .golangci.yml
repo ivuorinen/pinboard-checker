@@ -1,6 +1,5 @@
 # golangci-lint configuration
-# Version: 2.5.0 (golangci-lint v2)
-# Go Version: 1.25
+# Version: 2.12.2 (golangci-lint v2)
 
 version: "2"
 
@@ -11,7 +10,6 @@ run:
   build-tags: []
   modules-download-mode: readonly
   allow-parallel-runners: false
-  go: "1.25"
   concurrency: 0
 
 output:
