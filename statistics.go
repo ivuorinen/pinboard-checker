@@ -2,10 +2,23 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 )
+
+// newStatistics builds a Statistics with its maps ready. Every caller needs the
+// same three maps initialized, and a nil map panics on write, so construction
+// lives here rather than being repeated at each literal.
+func newStatistics() *Statistics {
+	return &Statistics{
+		ShortURLsExpanded: make(map[string]int),
+		ShortURLsFailed:   make(map[string]int),
+		StatusCodes:       make(map[string]map[int]int),
+	}
+}
 
 type Statistics struct {
 	mu sync.Mutex
@@ -48,7 +61,38 @@ type Statistics struct {
 	DeletionsPerformed int
 
 	// Errors
-	TotalErrors int
+	// Skipped counts bookmarks this tool could not verify — an undialable
+	// scheme, a timeout, a DNS failure. They are left untouched; the count
+	// exists so a run says how much it declined to judge instead of staying
+	// silent about it.
+	Skipped int
+	// ApplyErrors counts writes Pinboard rejected. Without it a non-verbose run
+	// reported only successes and exited 0, so a partly failed run looked clean.
+	ApplyErrors int
+}
+
+// RecordSkipped books a bookmark that was left alone because it could not be
+// checked.
+func (s *Statistics) RecordSkipped() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Skipped++
+}
+
+// RecordApplyError books a write Pinboard refused.
+func (s *Statistics) RecordApplyError() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ApplyErrors++
+}
+
+// ApplyErrorCount reports how many writes failed, so the caller can set a
+// non-zero exit status.
+func (s *Statistics) ApplyErrorCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.ApplyErrors
 }
 
 func (s *Statistics) RecordAction(action BookmarkAction) {
@@ -71,7 +115,6 @@ func (s *Statistics) RecordAction(action BookmarkAction) {
 		}
 	case ActionDelete:
 		s.ActionDelete++
-		s.TotalErrors++
 	}
 }
 
@@ -170,6 +213,9 @@ func (s *Statistics) printActions() {
 	fmt.Printf("   No changes:         %d (%.1f%%)\n", s.ActionNoChange, noChangePercent)
 	fmt.Printf("   Updates:            %d (%.1f%%)\n", s.ActionUpdate, updatePercent)
 	fmt.Printf("   Deletions:          %d (%.1f%%)\n", s.ActionDelete, deletePercent)
+	if s.Skipped > 0 {
+		fmt.Printf("   %-20s%d\n", "Skipped (unchecked):", s.Skipped)
+	}
 	fmt.Println()
 }
 
@@ -223,28 +269,32 @@ func (s *Statistics) printShortenerStats(totalExpanded, totalFailed int) {
 	}
 
 	fmt.Println("   Short URLs expanded:")
-	if s.ShortURLsExpanded["bitly"] > 0 || s.ShortURLsFailed["bitly"] > 0 {
-		fmt.Printf("     • bit.ly:         %d success, %d failed\n",
-			s.ShortURLsExpanded["bitly"], s.ShortURLsFailed["bitly"])
-	}
-	if s.ShortURLsExpanded["tinyurl"] > 0 || s.ShortURLsFailed["tinyurl"] > 0 {
-		fmt.Printf("     • tinyurl:        %d success, %d failed\n",
-			s.ShortURLsExpanded["tinyurl"], s.ShortURLsFailed["tinyurl"])
-	}
-	if s.ShortURLsExpanded["isgd"] > 0 || s.ShortURLsFailed["isgd"] > 0 {
-		fmt.Printf("     • is.gd:          %d success, %d failed\n",
-			s.ShortURLsExpanded["isgd"], s.ShortURLsFailed["isgd"])
+
+	// Driven by the same list expandURL dispatches on, so a new shortener
+	// cannot be added to the dispatch and forgotten in the report.
+	for _, service := range shortenerServices {
+		expanded, failed := s.ShortURLsExpanded[service.key], s.ShortURLsFailed[service.key]
+		if expanded == 0 && failed == 0 {
+			continue
+		}
+		fmt.Printf("     • %-16s%d success, %d failed\n",
+			service.display+":", expanded, failed)
 	}
 }
 
+// printHTTPResponses renders the per-operation status breakdown.
+//
+// Operations and status codes are sorted before printing: ranging a map
+// directly randomizes the order, so two runs over an unchanged account produced
+// textually different reports that could not be diffed.
 func (s *Statistics) printHTTPResponses() {
 	if len(s.StatusCodes) == 0 {
 		return
 	}
 
 	fmt.Println("🌐 HTTP RESPONSES")
-	for operation, codes := range s.StatusCodes {
-		s.printHTTPOperation(operation, codes)
+	for _, operation := range slices.Sorted(maps.Keys(s.StatusCodes)) {
+		s.printHTTPOperation(operation, s.StatusCodes[operation])
 	}
 	fmt.Println()
 }
@@ -252,34 +302,35 @@ func (s *Statistics) printHTTPResponses() {
 func (s *Statistics) printHTTPOperation(operation string, codes map[int]int) {
 	operationName := operation
 	switch operation {
-	case "url-validation":
+	case opURLValidation:
 		operationName = "URL Validation"
-	case "title-fetch":
+	case opTitleFetch:
 		operationName = "Title Fetch"
-	case "tag-fetch":
+	case opTagFetch:
 		operationName = "Tag Fetch"
 	}
 
 	fmt.Printf("   %s:\n", operationName)
-	for statusCode, count := range codes {
+
+	for _, statusCode := range slices.Sorted(maps.Keys(codes)) {
 		statusText := http.StatusText(statusCode)
 		if statusText == "" {
 			statusText = "Unknown"
 		}
-		fmt.Printf("     • %d %s: %d\n", statusCode, statusText, count)
+		fmt.Printf("     • %d %s: %d\n", statusCode, statusText, codes[statusCode])
 	}
 }
 
 func (s *Statistics) printAPIOperations() {
 	if s.TitlesFetched == 0 && s.TagsFetched == 0 &&
 		s.UpdatesPerformed == 0 && s.DeletionsPerformed == 0 &&
-		s.TitlesFailed == 0 && s.TagsFailed == 0 {
+		s.TitlesFailed == 0 && s.TagsFailed == 0 && s.ApplyErrors == 0 {
 		return
 	}
 
 	fmt.Println("⚙️  API OPERATIONS")
-	s.printTitleStats()
-	s.printTagStats()
+	printFetchStats("Titles fetched", s.TitlesFetched, s.TitlesFailed)
+	printFetchStats("Tags fetched", s.TagsFetched, s.TagsFailed)
 
 	if s.UpdatesPerformed > 0 {
 		fmt.Printf("   Updates performed:  %d\n", s.UpdatesPerformed)
@@ -287,29 +338,23 @@ func (s *Statistics) printAPIOperations() {
 	if s.DeletionsPerformed > 0 {
 		fmt.Printf("   Deletions performed: %d\n", s.DeletionsPerformed)
 	}
-	fmt.Println()
-}
-
-func (s *Statistics) printTitleStats() {
-	if s.TitlesFetched == 0 && s.TitlesFailed == 0 {
-		return
-	}
-
-	fmt.Printf("   Titles fetched:     %d", s.TitlesFetched)
-	if s.TitlesFailed > 0 {
-		fmt.Printf(" (%d failed)", s.TitlesFailed)
+	if s.ApplyErrors > 0 {
+		fmt.Printf("   Writes rejected:    %d\n", s.ApplyErrors)
 	}
 	fmt.Println()
 }
 
-func (s *Statistics) printTagStats() {
-	if s.TagsFetched == 0 && s.TagsFailed == 0 {
+// printFetchStats renders one "N fetched (M failed)" line, or nothing when the
+// operation never ran. The %-20s padding replaces hand-counted spacing, which
+// had already drifted out of alignment for the longer labels.
+func printFetchStats(label string, fetched, failed int) {
+	if fetched == 0 && failed == 0 {
 		return
 	}
 
-	fmt.Printf("   Tags fetched:       %d", s.TagsFetched)
-	if s.TagsFailed > 0 {
-		fmt.Printf(" (%d failed)", s.TagsFailed)
+	fmt.Printf("   %-20s%d", label+":", fetched)
+	if failed > 0 {
+		fmt.Printf(" (%d failed)", failed)
 	}
 	fmt.Println()
 }

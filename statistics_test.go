@@ -20,7 +20,7 @@ func TestRecordAction_NoChange(t *testing.T) {
 	}
 
 	action := BookmarkAction{
-		Original: Bookmark{URL: "http://example.com"},
+		Original: Bookmark{URL: testURL},
 		Action:   ActionNoChange,
 	}
 
@@ -43,7 +43,7 @@ func TestRecordAction_Update(t *testing.T) {
 	}
 
 	action := BookmarkAction{
-		Original: Bookmark{URL: "http://example.com"},
+		Original: Bookmark{URL: testURL},
 		Action:   ActionUpdate,
 		NewURL:   "http://example.org",
 		NewTitle: "New Title",
@@ -75,7 +75,7 @@ func TestRecordAction_UpdateSameURL(t *testing.T) {
 	}
 
 	action := BookmarkAction{
-		Original: Bookmark{URL: "http://example.com"},
+		Original: Bookmark{URL: testURL},
 		Action:   ActionUpdate,
 		NewURL:   "http://example.com", // Same URL
 		NewTitle: "New Title",
@@ -100,7 +100,7 @@ func TestRecordAction_Delete(t *testing.T) {
 	}
 
 	action := BookmarkAction{
-		Original: Bookmark{URL: "http://example.com"},
+		Original: Bookmark{URL: testURL},
 		Action:   ActionDelete,
 		Error:    errors.New("404 not found"),
 	}
@@ -110,8 +110,8 @@ func TestRecordAction_Delete(t *testing.T) {
 	if stats.ActionDelete != 1 {
 		t.Errorf("expected ActionDelete to be 1, got %d", stats.ActionDelete)
 	}
-	if stats.TotalErrors != 1 {
-		t.Errorf("expected TotalErrors to be 1, got %d", stats.TotalErrors)
+	if stats.ActionUpdate != 0 || stats.ActionNoChange != 0 {
+		t.Error("a delete must not increment the other action counters")
 	}
 }
 
