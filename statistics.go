@@ -53,10 +53,16 @@ type Statistics struct {
 	StatusCodes map[string]map[int]int // operation -> status code -> count
 
 	// API operations
-	TitlesFetched      int
-	TitlesFailed       int
-	TagsFetched        int
-	TagsFailed         int
+	TitlesFetched int
+	TitlesFailed  int
+	TagsFetched   int
+	TagsFailed    int
+	// TitlesEmpty and TagsEmpty count calls that succeeded and had nothing to
+	// add — a page with no <title>, a URL Pinboard has no suggestions for.
+	// Kept apart from the Failed counters, which previously absorbed them and
+	// reported hundreds of failures on a run where nothing failed.
+	TitlesEmpty        int
+	TagsEmpty          int
 	UpdatesPerformed   int
 	DeletionsPerformed int
 
@@ -69,6 +75,19 @@ type Statistics struct {
 	// ApplyErrors counts writes Pinboard rejected. Without it a non-verbose run
 	// reported only successes and exited 0, so a partly failed run looked clean.
 	ApplyErrors int
+	// Merged counts bookmarks whose new URL was one the account already held,
+	// so the duplicate was removed and the existing entry left alone. Counted
+	// separately from Updates because nothing was written: reporting a merge as
+	// an update hid the fact that a second copy of a page had existed.
+	Merged int
+}
+
+// RecordMerged books a duplicate collapsed into a bookmark that already existed
+// at the destination URL.
+func (s *Statistics) RecordMerged() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Merged++
 }
 
 // RecordSkipped books a bookmark that was left alone because it could not be
@@ -151,25 +170,41 @@ func (s *Statistics) IncrementRedirects() {
 	s.Redirects++
 }
 
-func (s *Statistics) RecordTitleFetch(success bool) {
+// RecordTitleFetch books a title lookup as one of three outcomes.
+//
+// Empty-but-no-error is its own outcome, not a failure: a page with no <title>
+// is a successful fetch with nothing to add. Folding it into TitlesFailed made
+// a completely healthy run print "Titles fetched: 12 (188 failed)" directly
+// under an HTTP block showing 200 responses throughout.
+func (s *Statistics) RecordTitleFetch(found bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if success {
-		s.TitlesFetched++
-	} else {
+	switch {
+	case err != nil:
 		s.TitlesFailed++
+	case found:
+		s.TitlesFetched++
+	default:
+		s.TitlesEmpty++
 	}
 }
 
-func (s *Statistics) RecordTagFetch(success bool) {
+// RecordTagFetch books a tag lookup as one of three outcomes; see
+// RecordTitleFetch. Pinboard having no suggestions for a URL is the common
+// case, not an error — getSuggestedTags returns an empty string for it so the
+// bookmark is left alone.
+func (s *Statistics) RecordTagFetch(found bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if success {
-		s.TagsFetched++
-	} else {
+	switch {
+	case err != nil:
 		s.TagsFailed++
+	case found:
+		s.TagsFetched++
+	default:
+		s.TagsEmpty++
 	}
 }
 
@@ -324,13 +359,14 @@ func (s *Statistics) printHTTPOperation(operation string, codes map[int]int) {
 func (s *Statistics) printAPIOperations() {
 	if s.TitlesFetched == 0 && s.TagsFetched == 0 &&
 		s.UpdatesPerformed == 0 && s.DeletionsPerformed == 0 &&
-		s.TitlesFailed == 0 && s.TagsFailed == 0 && s.ApplyErrors == 0 {
+		s.TitlesFailed == 0 && s.TagsFailed == 0 && s.ApplyErrors == 0 &&
+		s.TitlesEmpty == 0 && s.TagsEmpty == 0 && s.Merged == 0 {
 		return
 	}
 
 	fmt.Println("⚙️  API OPERATIONS")
-	printFetchStats("Titles fetched", s.TitlesFetched, s.TitlesFailed)
-	printFetchStats("Tags fetched", s.TagsFetched, s.TagsFailed)
+	printFetchStats("Titles fetched", s.TitlesFetched, s.TitlesEmpty, s.TitlesFailed)
+	printFetchStats("Tags fetched", s.TagsFetched, s.TagsEmpty, s.TagsFailed)
 
 	if s.UpdatesPerformed > 0 {
 		fmt.Printf("   Updates performed:  %d\n", s.UpdatesPerformed)
@@ -338,21 +374,31 @@ func (s *Statistics) printAPIOperations() {
 	if s.DeletionsPerformed > 0 {
 		fmt.Printf("   Deletions performed: %d\n", s.DeletionsPerformed)
 	}
+	if s.Merged > 0 {
+		fmt.Printf("   %-20s%d\n", "Duplicates merged:", s.Merged)
+	}
 	if s.ApplyErrors > 0 {
 		fmt.Printf("   Writes rejected:    %d\n", s.ApplyErrors)
 	}
 	fmt.Println()
 }
 
-// printFetchStats renders one "N fetched (M failed)" line, or nothing when the
-// operation never ran. The %-20s padding replaces hand-counted spacing, which
-// had already drifted out of alignment for the longer labels.
-func printFetchStats(label string, fetched, failed int) {
-	if fetched == 0 && failed == 0 {
+// printFetchStats renders one "N fetched" line with its qualifiers, or nothing
+// when the operation never ran. The %-20s padding replaces hand-counted
+// spacing, which had already drifted out of alignment for the longer labels.
+//
+// empty and failed are printed separately because they mean different things:
+// nothing to add is a successful call, a failure is not, and merging them told
+// the reader a healthy run had gone wrong.
+func printFetchStats(label string, fetched, empty, failed int) {
+	if fetched == 0 && empty == 0 && failed == 0 {
 		return
 	}
 
 	fmt.Printf("   %-20s%d", label+":", fetched)
+	if empty > 0 {
+		fmt.Printf(" (%d with nothing to add)", empty)
+	}
 	if failed > 0 {
 		fmt.Printf(" (%d failed)", failed)
 	}

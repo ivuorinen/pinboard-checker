@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,6 +55,12 @@ const (
 	// maxWorkers caps -workers. Every worker holds an open connection, so
 	// values beyond this exhaust file descriptors before they add throughput.
 	maxWorkers = 100
+
+	// defaultPerHostInterval spaces requests to any one bookmarked host. Two
+	// per second is slow enough not to look like a scrape and fast enough that
+	// an account spread over many domains is unaffected, since distinct hosts
+	// never wait on each other. Tune it with -host-interval.
+	defaultPerHostInterval = 500 * time.Millisecond
 
 	// maxTitleFetchBytes caps how much of a remote page is parsed as HTML.
 	// html.Parse reads to EOF and retains the tree, so an unbounded response
@@ -117,15 +124,94 @@ var (
 
 // httpClient carries the deadline for every request. http.DefaultClient has a
 // zero Timeout, which is why none of the package-level helpers are used here.
-var httpClient = &http.Client{Timeout: defaultHTTPTimeout}
+var httpClient = &http.Client{
+	Timeout:   defaultHTTPTimeout,
+	Transport: newUserAgentTransport(),
+}
 
 // redirectClient reports the first redirect instead of following it, so a
 // bookmark can be rewritten to its destination. It shares httpClient's deadline.
 var redirectClient = &http.Client{
-	Timeout: defaultHTTPTimeout,
+	Timeout:   defaultHTTPTimeout,
+	Transport: newUserAgentTransport(),
 	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
+}
+
+// userAgentTransport names this tool on every outbound request. Go's default
+// User-Agent is indistinguishable from any other script, so a host with abuse
+// protection has nothing to allow-list and nothing to complain to; it answers
+// 403 or 429 instead, which is precisely the answer this tool must not receive.
+type userAgentTransport struct {
+	base http.RoundTripper
+	ua   string
+}
+
+func newUserAgentTransport() *userAgentTransport {
+	return &userAgentTransport{base: http.DefaultTransport}
+}
+
+// RoundTrip sets the User-Agent unless the caller already chose one. The
+// request is cloned first: RoundTrip must not modify the request it is given.
+//
+// The transport's error is returned unaltered. net/http inspects what RoundTrip
+// returns to decide whether a request may be retried, and wraps it into the
+// *url.Error that sanitizeTransportError later strips the token out of; adding
+// a layer here changes both.
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.ua == "" {
+		t.ua = "pinboard-checker/" + versionString() +
+			" (+https://github.com/ivuorinen/pinboard-checker)"
+	}
+
+	if req.Header.Get("User-Agent") != "" {
+		return t.base.RoundTrip(req) //nolint:wrapcheck // see docstring
+	}
+
+	clone := req.Clone(req.Context())
+	clone.Header.Set("User-Agent", t.ua)
+
+	return t.base.RoundTrip(clone) //nolint:wrapcheck // see docstring
+}
+
+// perHostInterval spaces requests to any single bookmarked host. Set from
+// -host-interval; zero disables the throttle entirely. A variable rather than a
+// constant so the flag can set it and the test suite can zero it (see TestMain).
+var perHostInterval = defaultPerHostInterval
+
+var (
+	// hostNextSlot records the earliest time the next request to each host may
+	// start. The Pinboard limiter does not cover these hosts: it guards one
+	// API, while a ten-worker pool checking forty bookmarks on one domain sends
+	// forty requests there in seconds. That reads as a scrape and is answered
+	// with 403 or 429 — answers this tool then had to interpret, having caused
+	// them itself.
+	hostNextSlot = map[string]time.Time{}
+	hostSlotMux  sync.Mutex
+)
+
+// waitForHost blocks until this caller's reserved slot for the URL's host.
+//
+// The slot is reserved under the lock and waited for outside it, so requests to
+// different hosts still run in parallel — unlike waitForRateLimit, which holds
+// its mutex across the wait precisely to make the Pinboard budget global.
+func waitForHost(rawURL string) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || perHostInterval <= 0 {
+		return
+	}
+
+	hostSlotMux.Lock()
+	now := time.Now()
+	slot := hostNextSlot[parsed.Host]
+	if slot.Before(now) {
+		slot = now
+	}
+	hostNextSlot[parsed.Host] = slot.Add(perHostInterval)
+	hostSlotMux.Unlock()
+
+	time.Sleep(time.Until(slot))
 }
 
 // Bookmark mirrors one entry from posts/all. Time, Shared, and ToRead are
@@ -175,54 +261,122 @@ var (
 	rateLimiterMux    sync.Mutex
 
 	stats = newStatistics()
+
+	// knownURLs holds every URL the account already had when the run started.
+	// applyUpdateWrite consults it before rewriting a bookmark onto a new URL:
+	// posts/add with replace=yes overwrites the whole entry, so writing the
+	// moved bookmark's fields over an address the user had already bookmarked
+	// discarded that bookmark's notes, tags, and creation date. Filled once in
+	// run(), read-only afterwards, which is why it needs no mutex.
+	knownURLs = map[string]bool{}
 )
 
+// osExit is a variable so main can be exercised without ending the test binary.
+// It is the only reason main is not itself untestable.
+var osExit = os.Exit
+
 func main() {
+	osExit(cli(os.Args[1:], os.Stderr))
+}
+
+// options holds the parsed command line. The pointers are the flag package's,
+// filled by registerFlags at Parse time.
+type options struct {
+	token        *string
+	dryRun       *bool
+	timeout      *time.Duration
+	hostInterval *time.Duration
+	workers      *int
+	showVersion  *bool
+}
+
+// registerFlags declares every flag on fs.
+//
+// It takes a FlagSet rather than using flag.CommandLine so the command line can
+// be parsed more than once in one process — the global set panics on a second
+// registration, which made main untestable. It is also the single list the
+// README flag test checks against, so a flag cannot be added here and left out
+// of the documentation.
+func registerFlags(flagSet *flag.FlagSet) *options {
+	return &options{
+		// The token is deliberately NOT the flag default: PrintDefaults renders
+		// a non-empty default into the usage text, so -h (and any flag typo)
+		// printed the live API token to the terminal and into CI logs.
+		token:  flagSet.String("token", "", "Pinboard API token (default: $"+tokenName+")"),
+		dryRun: flagSet.Bool("dry-run", false, "Dry run mode"),
+		timeout: flagSet.Duration("timeout", defaultHTTPTimeout,
+			"Per-request HTTP timeout"),
+		hostInterval: flagSet.Duration("host-interval", defaultPerHostInterval,
+			"Minimum delay between requests to one bookmarked host (0 disables)"),
+		workers:     flagSet.Int("workers", 10, "Number of concurrent workers (1-100)"),
+		showVersion: flagSet.Bool("version", false, "Print version and exit"),
+	}
+}
+
+// cli parses args, applies them, and returns the process exit code.
+//
+// Split out of main so every branch above os.Exit is reachable from a test: the
+// exit-code contract is the tool's CI-facing interface, and it previously had
+// no coverage at all.
+func cli(args []string, stderr io.Writer) int {
 	// A .env file is optional; a missing one is not an error.
 	_ = godotenv.Load() //nolint:errcheck // .env file is optional
 
-	// The token is deliberately NOT the flag default: flag.PrintDefaults renders
-	// a non-empty default into the usage text, so -h (and any flag typo) printed
-	// the live API token to the terminal and into CI logs.
-	apiToken := flag.String("token", "", "Pinboard API token (default: $"+tokenName+")")
-	dryRun := flag.Bool("dry-run", false, "Dry run mode")
-	timeout := flag.Duration("timeout", defaultHTTPTimeout, "Per-request HTTP timeout")
-	flag.BoolVar(&verbose, "verbose", false, "Verbose mode")
-	flag.BoolVar(&ciMode, "ci", false, "CI mode (no progress bar or verbose output)")
-	flag.BoolVar(&skipTitles, "skip-titles", false, "Skip fetching titles for bookmarks without them")
-	flag.BoolVar(&skipAutoTags, "skip-auto-tags", false, "Skip auto-tagging bookmarks without tags")
-	workers := flag.Int("workers", 10, "Number of concurrent workers (1-100)")
-	showVersion := flag.Bool("version", false, "Print version and exit")
-	flag.Parse()
+	flagSet := flag.NewFlagSet("pinboard-checker", flag.ContinueOnError)
+	flagSet.SetOutput(stderr)
 
-	if *showVersion {
-		fmt.Println(versionString())
+	opts := registerFlags(flagSet)
+	flagSet.BoolVar(&verbose, "verbose", false, "Verbose mode")
+	flagSet.BoolVar(&ciMode, "ci", false, "CI mode (no progress bar or verbose output)")
+	flagSet.BoolVar(&skipTitles, "skip-titles", false,
+		"Skip fetching titles for bookmarks without them")
+	flagSet.BoolVar(&skipAutoTags, "skip-auto-tags", false,
+		"Skip auto-tagging bookmarks without tags")
 
-		return
+	if err := flagSet.Parse(args); err != nil {
+		// -h is a request, not a failure; anything else is a malformed command
+		// line, which exits 2 as convention has it for usage errors.
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+
+		return 2
 	}
 
-	token := *apiToken
+	if *opts.showVersion {
+		fmt.Println(versionString())
+
+		return 0
+	}
+
+	token := *opts.token
 	if token == "" {
 		token = os.Getenv(tokenName)
 	}
 
-	if code := validateFlags(token, *workers, *timeout); code != 0 {
-		os.Exit(code)
+	if code := validateFlags(token, *opts.workers, *opts.timeout,
+		*opts.hostInterval); code != 0 {
+		return code
 	}
 
-	setHTTPTimeout(*timeout)
+	setHTTPTimeout(*opts.timeout)
+	perHostInterval = *opts.hostInterval
 
-	os.Exit(run(token, *workers, *dryRun))
+	return run(token, *opts.workers, *opts.dryRun)
 }
 
 // versionString reports the release version. Only GoReleaser sets it; a
 // `go install`ed or `go build`ed binary has an empty version, so fall back to
 // the module version the toolchain stamps into the build info.
+// readBuildInfo is a variable so the no-build-info fallback can be tested; a
+// test binary always has build info, so "dev" was otherwise unreachable.
+var readBuildInfo = debug.ReadBuildInfo
+
 func versionString() string {
 	if version != "" {
 		return version
 	}
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+	if info, ok := readBuildInfo(); ok && info.Main.Version != "" {
 		return info.Main.Version
 	}
 
@@ -232,7 +386,12 @@ func versionString() string {
 // validateFlags returns a non-zero exit code for any invalid combination.
 // -workers was previously unchecked: zero produced an unbuffered semaphore that
 // deadlocked the dispatch loop, and a negative value panicked inside make.
-func validateFlags(token string, workers int, timeout time.Duration) int {
+//
+// hostInterval may be zero — that switches the per-host throttle off, which is
+// a legitimate choice for an account whose bookmarks are spread thin. Only a
+// negative value is rejected, since it would silently mean the same as zero
+// while reading like a setting.
+func validateFlags(token string, workers int, timeout, hostInterval time.Duration) int {
 	if token == "" {
 		fmt.Fprintf(os.Stderr,
 			"Error: API token is required (set %s or pass -token)\n", tokenName)
@@ -247,6 +406,13 @@ func validateFlags(token string, workers int, timeout time.Duration) int {
 	}
 	if timeout <= 0 {
 		fmt.Fprintf(os.Stderr, "Error: -timeout must be positive, got %s\n", timeout)
+
+		return 1
+	}
+	if hostInterval < 0 {
+		fmt.Fprintf(os.Stderr,
+			"Error: -host-interval must not be negative, got %s (use 0 to disable)\n",
+			hostInterval)
 
 		return 1
 	}
@@ -273,6 +439,11 @@ func run(apiToken string, workers int, dryRun bool) int {
 		return 1
 	}
 	stats.TotalBookmarks = len(bookmarks)
+
+	knownURLs = make(map[string]bool, len(bookmarks))
+	for _, bookmark := range bookmarks {
+		knownURLs[bookmark.URL] = true
+	}
 
 	// Phase 1: process bookmarks in parallel and collect actions.
 	stats.ProcessingStart = time.Now()
@@ -575,7 +746,7 @@ func fetchTitleIfNeeded(b Bookmark, newURL string) string {
 	}
 
 	fetchedTitle, err := getPageTitle(targetURL(b.URL, newURL))
-	stats.RecordTitleFetch(err == nil && fetchedTitle != "")
+	stats.RecordTitleFetch(fetchedTitle != "", err)
 
 	if err == nil && fetchedTitle != "" {
 		if verbose {
@@ -594,7 +765,7 @@ func fetchTagsIfNeeded(b Bookmark, apiToken, newURL string) string {
 	}
 
 	fetchedTags, err := getSuggestedTags(apiToken, targetURL(b.URL, newURL))
-	stats.RecordTagFetch(err == nil && fetchedTags != "")
+	stats.RecordTagFetch(fetchedTags != "", err)
 
 	if err == nil && fetchedTags != "" {
 		if verbose {
@@ -677,10 +848,19 @@ func reportApplyError(operation, urlStr string, err error) {
 // changed, removes the stale entry. posts/add is keyed by URL, so without the
 // delete a moved bookmark exists twice. The delete runs only after the add
 // succeeded: interrupted the other way round, the bookmark would be lost.
+//
+// A target the account already holds is merged instead of written: see
+// mergeIntoExisting.
 func applyUpdateWrite(action BookmarkAction, apiToken string) {
 	urlToUpdate := action.NewURL
 	if urlToUpdate == "" {
 		urlToUpdate = action.Original.URL
+	}
+
+	if urlToUpdate != action.Original.URL && knownURLs[urlToUpdate] {
+		mergeIntoExisting(action, apiToken, urlToUpdate)
+
+		return
 	}
 
 	err := updateBookmark(apiToken, action.Original, urlToUpdate,
@@ -701,6 +881,32 @@ func applyUpdateWrite(action BookmarkAction, apiToken string) {
 	if err := deleteBookmark(apiToken, action.Original.URL); err != nil {
 		stats.RecordApplyError()
 		reportApplyError("removing old URL", action.Original.URL, err)
+	}
+}
+
+// mergeIntoExisting drops the stale bookmark when its new URL is one the
+// account already holds, leaving the existing entry untouched.
+//
+// The alternative is what this code used to do: post the moved bookmark's
+// fields at the destination with replace=yes, which overwrites the whole entry
+// there. Two bookmarks of the same page are ordinary — an http:// one that
+// redirects to its https:// twin, two shortener links to one article — and
+// overwriting silently replaced the destination's hand-written notes and tags
+// with the source's empty ones, then deleted the only copy they survived in.
+// The destination is the entry the user curated; the mover is the duplicate.
+func mergeIntoExisting(action BookmarkAction, apiToken, targetURL string) {
+	if err := deleteBookmark(apiToken, action.Original.URL); err != nil {
+		stats.RecordApplyError()
+		reportApplyError("removing merged duplicate", action.Original.URL, err)
+
+		return
+	}
+
+	stats.RecordMerged()
+
+	if verbose {
+		fmt.Printf("Merged: %s already bookmarked as %s; removed the duplicate\n",
+			action.Original.URL, targetURL)
 	}
 }
 
@@ -849,6 +1055,8 @@ func deleteBookmark(apiToken, urlStr string) error {
 // getPageTitle fetches a URL and extracts its <title>. It returns an empty
 // string when no title is present; there is no fallback.
 func getPageTitle(urlString string) (string, error) {
+	waitForHost(urlString)
+
 	resp, err := httpClient.Get(urlString)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch page for title extraction: %w", err)
@@ -1001,6 +1209,46 @@ func isCheckableURL(urlString string) bool {
 // loop on a redirect cycle.
 const maxRedirectHops = 5
 
+// isPublicHost is a variable so the test suite can bypass it: httptest serves
+// on 127.0.0.1, which the real check correctly rejects, so every redirect test
+// would otherwise be testing the guard rather than the redirect. TestMain
+// swaps it out; the guard itself is tested directly.
+var isPublicHost = isPublicHostImpl
+
+// isPublicHostImpl reports whether every address a URL's host resolves to is
+// publicly routable.
+//
+// A redirect target and a shortener's answer are both chosen by a remote party,
+// not by the user. Without this check a bookmarked host could redirect the tool
+// to http://169.254.169.254/ or a service on localhost, and the tool would then
+// rewrite the bookmark to that address and post the internal page's title to
+// Pinboard — a third-party service.
+//
+// The ceiling: this resolves before dialing, so a host that answers with a
+// public address here and a private one to the dialer still gets through.
+// Closing that needs a DialContext hook on the transport, which is worth adding
+// only if this proves insufficient. A host that will not resolve is treated as
+// non-public, because an unresolvable target cannot be verified either way.
+func isPublicHostImpl(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	addrs, err := net.LookupIP(parsed.Hostname())
+	if err != nil || len(addrs) == 0 {
+		return false
+	}
+
+	for _, ip := range addrs {
+		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+			return false
+		}
+	}
+
+	return true
+}
+
 // expandAndCheckURL resolves a bookmark URL to its final form and confirms the
 // result is reachable.
 //
@@ -1009,13 +1257,8 @@ const maxRedirectHops = 5
 // made a URL broken only by its trailing parenthesis look like a dead link, and
 // the bookmark was deleted instead of fixed.
 func expandAndCheckURL(urlString string, verbose bool) (string, error) {
-	steps := []urlStep{
-		{name: "expanded URL", fn: expandURL},
-		{name: "fixed URL", fn: fixParenthesesSuffix},
-	}
-
 	current := urlString
-	for _, step := range steps {
+	for _, step := range repairSteps {
 		next, err := step.fn(current, verbose)
 		if err != nil {
 			return "", err
@@ -1051,6 +1294,10 @@ func followRedirects(urlString string, verbose bool) (string, error) {
 			return "", fmt.Errorf("%w: redirected URL is not an http(s) URL: %q",
 				errUnverifiable, redirect)
 		}
+		if !isPublicHost(redirect) {
+			return "", fmt.Errorf("%w: redirected URL is not a public host: %q",
+				errUnverifiable, redirect)
+		}
 
 		stats.IncrementRedirects()
 
@@ -1072,16 +1319,29 @@ type urlStep struct {
 	fn   func(string, bool) (string, error)
 }
 
+// repairSteps run in order, before any liveness check. Order is load-bearing:
+// see expandAndCheckURL.
+//
+// A package variable rather than a literal inside that function so a test can
+// inject a failing step. Neither real step returns an error today, which left
+// the pipeline's error path unreachable and therefore unverified — and a step
+// added later that does fail would find that path untested.
+var repairSteps = []urlStep{
+	{name: "expanded URL", fn: expandURL},
+	{name: "fixed URL", fn: fixParenthesesSuffix},
+}
+
 // checkURL performs one HEAD and reports both verdicts it carries: whether the
 // URL is still live, and where it redirects. An empty redirect means the URL is
 // final.
 //
-// Only a 4xx justifies errDeadLink. A transport failure yields errUnverifiable,
-// because a timeout or a DNS hiccup is not evidence the bookmark is dead. 403
-// and 405 are re-checked with GET first: many hosts refuse HEAD outright or
-// serve it through bot protection, and deleting on that answer destroyed live
-// bookmarks.
+// Only 404 and 410 justify errDeadLink; see isDeadLinkStatus. Every other 4xx,
+// and any transport failure, yields errUnverifiable, because being refused is
+// not evidence the bookmark is gone. 403 and 405 are re-checked with GET first:
+// many hosts refuse HEAD outright or serve it through bot protection.
 func checkURL(urlString, context string) (string, error) {
+	waitForHost(urlString)
+
 	resp, err := redirectClient.Head(urlString)
 	if err != nil {
 		return "", fmt.Errorf("%w: failed to check %s: %w", errUnverifiable, context, err)
@@ -1095,8 +1355,11 @@ func checkURL(urlString, context string) (string, error) {
 
 	stats.RecordHTTPStatus(opURLValidation, status)
 
-	if status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+	if isDeadLinkStatus(status) {
 		return "", fmt.Errorf("%w: %s returns status %d", errDeadLink, context, status)
+	}
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+		return "", fmt.Errorf("%w: %s returns status %d", errUnverifiable, context, status)
 	}
 
 	if !isRedirectStatus(status) {
@@ -1113,6 +1376,19 @@ func checkURL(urlString, context string) (string, error) {
 	return target.String(), nil
 }
 
+// isDeadLinkStatus reports whether a status asserts the resource itself is
+// gone, which is the only ground for deleting a bookmark.
+//
+// The set is deliberately just these two. Treating the whole 4xx range as dead
+// deleted bookmarks over answers that describe the request rather than the
+// resource: 429 and 408 are throttling — which this tool provokes itself, by
+// checking many bookmarks on one host at once — 401 and 403 are access control,
+// and 451 is a legal block, all of which leave the page in place. Every one of
+// them is the "could not check" case that must be skipped and counted.
+func isDeadLinkStatus(status int) bool {
+	return status == http.StatusNotFound || status == http.StatusGone
+}
+
 // isRedirectStatus covers the full redirect set. Handling only 301 and 302
 // missed most modern permanent redirects, which use 308.
 func isRedirectStatus(status int) bool {
@@ -1125,17 +1401,11 @@ func isRedirectStatus(status int) bool {
 	}
 }
 
-// validateURLAccessibility reports whether a URL is still live, discarding any
-// redirect target. It exists for callers that only need the verdict.
-func validateURLAccessibility(urlString, context string) error {
-	_, err := checkURL(urlString, context)
-
-	return err
-}
-
 // confirmWithGet re-requests a URL that refused HEAD, returning the GET status
 // when one is obtained and the original status otherwise.
 func confirmWithGet(urlString string, headStatus int) int {
+	waitForHost(urlString)
+
 	resp, err := httpClient.Get(urlString)
 	if err != nil {
 		return headStatus
@@ -1156,6 +1426,8 @@ func fixParenthesesSuffix(urlString string, verbose bool) (string, error) {
 	if verbose {
 		fmt.Printf("URL '%s' ends with ')', retrying without it.\n", urlString)
 	}
+
+	waitForHost(updatedURL)
 
 	resp, err := httpClient.Head(updatedURL)
 	if err != nil {
@@ -1270,6 +1542,11 @@ func unshortenBitlyImpl(shortURL string) (string, error) {
 
 	payload, err := json.Marshal(map[string]string{"bitlink_id": bitlinkID})
 	if err != nil {
+		// coverage:ignore json.Marshal cannot fail for a map[string]string —
+		// no channel, func, cycle, or unsupported type can occur here, and
+		// invalid UTF-8 is replaced rather than rejected. The check stays
+		// because discarding the error would misstate the API, not because it
+		// can fire.
 		return "", fmt.Errorf("failed to encode bit.ly request: %w", err)
 	}
 
@@ -1280,6 +1557,8 @@ func unshortenBitlyImpl(shortURL string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+
+	waitForHost(bitlyEndpoint)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -1305,6 +1584,8 @@ func unshortenBitlyImpl(shortURL string) (string, error) {
 // The previous implementation called api-create.php, which creates short URLs
 // rather than expanding them, and returned the raw response body as the URL.
 func unshortenTinyURLImpl(shortURL string) (string, error) {
+	waitForHost(shortURL)
+
 	resp, err := redirectClient.Head(shortURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to expand tinyurl.com URL: %w", err)
@@ -1325,6 +1606,8 @@ func unshortenTinyURLImpl(shortURL string) (string, error) {
 // the bookmark's new URL.
 func unshortenIsGdImpl(shortURL string) (string, error) {
 	query := url.Values{"format": {"json"}, "shorturl": {shortURL}}
+
+	waitForHost(isGdEndpoint)
 
 	resp, err := httpClient.Get(isGdEndpoint + "/forward.php?" + query.Encode())
 	if err != nil {
@@ -1366,6 +1649,9 @@ func validExpandedURL(candidate string) (string, error) {
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return "", fmt.Errorf("shortener returned a non-absolute URL %q", trimmed)
+	}
+	if !isPublicHost(trimmed) {
+		return "", fmt.Errorf("shortener returned a non-public host %q", trimmed)
 	}
 
 	return trimmed, nil

@@ -28,14 +28,26 @@ const (
 	testTagAlt   = "code"
 	testTagList  = "tags"
 	testFTPURL   = "ftp://ftp.example.com/file"
+	// testBadURL fails url.Parse: the IPv6 literal is never closed.
+	testBadURL = "http://[::1"
 )
 
-// TestMain shortens the global rate limiter for the whole suite. The production
-// interval is three seconds per Pinboard call, which would dominate the run
-// time; these tests exercise the request logic, not the pacing.
+// TestMain shortens the global rate limiter for the whole suite and disables
+// the per-host throttle. The production intervals are three seconds per
+// Pinboard call and half a second per bookmarked host, which would dominate the
+// run time; these tests exercise the request logic, not the pacing. The pacing
+// itself is asserted by TestWaitForHost_SpacesRequestsToOneHost, which restores
+// a real interval for its own duration.
 func TestMain(m *testing.M) {
 	rateLimitInterval = time.Millisecond
 	rateLimiter.Reset(time.Millisecond)
+	perHostInterval = 0
+
+	// httptest serves on 127.0.0.1, which the real guard correctly rejects as
+	// non-public. Bypassing it here keeps the redirect and shortener tests
+	// about redirects and shorteners; the guard is tested directly in
+	// TestIsPublicHostImpl.
+	isPublicHost = func(string) bool { return true }
 
 	os.Exit(m.Run())
 }
@@ -401,7 +413,7 @@ func TestValidExpandedURL(t *testing.T) {
 		{name: "rejects empty", input: "", wantErr: true},
 		{name: "rejects relative", input: "/just/a/path", wantErr: true},
 		{name: "rejects an error page", input: "Error: no such short URL", wantErr: true},
-		{name: "rejects an unparseable URL", input: "http://[::1", wantErr: true},
+		{name: "rejects an unparseable URL", input: testBadURL, wantErr: true},
 	}
 
 	for _, testCase := range tests {

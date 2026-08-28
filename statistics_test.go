@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// errTestFetch stands in for a transport failure, so the counter tests can tell
+// a failed fetch apart from one that succeeded with nothing to add.
+var errTestFetch = errors.New("fetch failed")
+
 func TestRecordAction_NoChange(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
@@ -204,15 +208,20 @@ func TestRecordTitleFetch(t *testing.T) {
 		StatusCodes:       make(map[string]map[int]int),
 	}
 
-	stats.RecordTitleFetch(true)
-	stats.RecordTitleFetch(true)
-	stats.RecordTitleFetch(false)
+	stats.RecordTitleFetch(true, nil)
+	stats.RecordTitleFetch(true, nil)
+	stats.RecordTitleFetch(false, errTestFetch)
+	// A page with no <title>: the fetch worked, there was nothing to take.
+	stats.RecordTitleFetch(false, nil)
 
 	if stats.TitlesFetched != 2 {
 		t.Errorf("expected TitlesFetched to be 2, got %d", stats.TitlesFetched)
 	}
 	if stats.TitlesFailed != 1 {
 		t.Errorf("expected TitlesFailed to be 1, got %d", stats.TitlesFailed)
+	}
+	if stats.TitlesEmpty != 1 {
+		t.Errorf("expected TitlesEmpty to be 1, got %d", stats.TitlesEmpty)
 	}
 }
 
@@ -224,15 +233,21 @@ func TestRecordTagFetch(t *testing.T) {
 		StatusCodes:       make(map[string]map[int]int),
 	}
 
-	stats.RecordTagFetch(true)
-	stats.RecordTagFetch(false)
-	stats.RecordTagFetch(false)
+	stats.RecordTagFetch(true, nil)
+	stats.RecordTagFetch(false, errTestFetch)
+	stats.RecordTagFetch(false, errTestFetch)
+	// Pinboard had no suggestions: a successful call with nothing to add, which
+	// is the common case for an untagged bookmark and never a failure.
+	stats.RecordTagFetch(false, nil)
 
 	if stats.TagsFetched != 1 {
 		t.Errorf("expected TagsFetched to be 1, got %d", stats.TagsFetched)
 	}
 	if stats.TagsFailed != 2 {
 		t.Errorf("expected TagsFailed to be 2, got %d", stats.TagsFailed)
+	}
+	if stats.TagsEmpty != 1 {
+		t.Errorf("expected TagsEmpty to be 1, got %d", stats.TagsEmpty)
 	}
 }
 
@@ -295,7 +310,7 @@ func TestThreadSafety(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			stats.RecordTitleFetch(true)
+			stats.RecordTitleFetch(true, nil)
 		}()
 
 		wg.Add(1)
@@ -529,6 +544,42 @@ func TestPrint_AllShorteners(t *testing.T) {
 	}
 	if !strings.Contains(output, "is.gd") {
 		t.Error("expected output to contain is.gd stats")
+	}
+}
+
+// Every conditional line in the API OPERATIONS block must render when its
+// counter is set. Each was added for a defect the report had previously hidden,
+// so a line that silently stopped printing would take the evidence with it.
+//
+//nolint:paralleltest // captureOutput swaps the global os.Stdout
+func TestPrintAPIOperations_RendersEveryCounter(t *testing.T) {
+	report := newStatistics()
+	report.TotalBookmarks = 1
+	report.TitlesFetched = 3
+	report.TitlesEmpty = 7
+	report.TitlesFailed = 2
+	report.TagsFetched = 1
+	report.TagsEmpty = 4
+	report.UpdatesPerformed = 5
+	report.DeletionsPerformed = 6
+	report.Merged = 8
+	report.ApplyErrors = 9
+
+	printed := captureOutput(report.Print)
+
+	for _, want := range []string{
+		"Titles fetched:     3",
+		"(7 with nothing to add)",
+		"(2 failed)",
+		"(4 with nothing to add)",
+		"Updates performed:  5",
+		"Deletions performed: 6",
+		"Duplicates merged:  8",
+		"Writes rejected:    9",
+	} {
+		if !strings.Contains(printed, want) {
+			t.Errorf("report is missing %q\n---\n%s", want, printed)
+		}
 	}
 }
 

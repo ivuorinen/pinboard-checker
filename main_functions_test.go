@@ -96,7 +96,7 @@ func TestIsCheckableURL(t *testing.T) {
 		{name: "javascript bookmarklet", input: "javascript:void(0)", want: false},
 		{name: "empty", input: "", want: false},
 		// url.Parse itself fails here, so the scheme can never be checked.
-		{name: "unparseable", input: "http://[::1", want: false},
+		{name: "unparseable", input: testBadURL, want: false},
 	}
 
 	for _, testCase := range tests {
@@ -209,33 +209,60 @@ func TestValidateFlags(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		token   string
-		workers int
-		timeout time.Duration
-		want    int
+		name         string
+		token        string
+		workers      int
+		timeout      time.Duration
+		hostInterval time.Duration
+		want         int
 	}{
-		{name: "valid", token: testToken, workers: 10, timeout: time.Second, want: 0},
-		{name: "missing token", token: "", workers: 10, timeout: time.Second, want: 1},
+		{
+			name: "valid", token: testToken, workers: 10,
+			timeout: time.Second, hostInterval: time.Second, want: 0,
+		},
+		{
+			name: "missing token", token: "", workers: 10,
+			timeout: time.Second, hostInterval: time.Second, want: 1,
+		},
 		// Zero produced an unbuffered semaphore and deadlocked the dispatch
 		// loop; a negative value panicked inside make.
-		{name: "zero workers", token: testToken, workers: 0, timeout: time.Second, want: 1},
-		{name: "negative workers", token: testToken, workers: -1, timeout: time.Second, want: 1},
 		{
-			name:    "too many workers",
-			token:   testToken,
-			workers: maxWorkers + 1,
-			timeout: time.Second,
-			want:    1,
+			name: "zero workers", token: testToken, workers: 0,
+			timeout: time.Second, hostInterval: time.Second, want: 1,
 		},
-		{name: "zero timeout", token: testToken, workers: 10, timeout: 0, want: 1},
+		{
+			name: "negative workers", token: testToken, workers: -1,
+			timeout: time.Second, hostInterval: time.Second, want: 1,
+		},
+		{
+			name:         "too many workers",
+			token:        testToken,
+			workers:      maxWorkers + 1,
+			timeout:      time.Second,
+			hostInterval: time.Second,
+			want:         1,
+		},
+		{
+			name: "zero timeout", token: testToken, workers: 10,
+			timeout: 0, hostInterval: time.Second, want: 1,
+		},
+		// Zero is how the per-host throttle is switched off, so it must pass.
+		{
+			name: "zero host interval disables the throttle", token: testToken, workers: 10,
+			timeout: time.Second, hostInterval: 0, want: 0,
+		},
+		{
+			name: "negative host interval", token: testToken, workers: 10,
+			timeout: time.Second, hostInterval: -time.Second, want: 1,
+		},
 	}
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := validateFlags(testCase.token, testCase.workers, testCase.timeout)
+			got := validateFlags(testCase.token, testCase.workers,
+				testCase.timeout, testCase.hostInterval)
 			if got != testCase.want {
 				t.Errorf("validateFlags() = %d, want %d", got, testCase.want)
 			}
@@ -244,7 +271,7 @@ func TestValidateFlags(t *testing.T) {
 }
 
 //nolint:paralleltest // writes to the stats singleton via RecordHTTPStatus
-func TestValidateURLAccessibility(t *testing.T) {
+func TestCheckURL_Verdicts(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
@@ -264,12 +291,12 @@ func TestValidateURLAccessibility(t *testing.T) {
 
 			server := staticServer(t, testCase.statusCode, "")
 
-			err := validateURLAccessibility(server.URL, "test context")
+			_, err := checkURL(server.URL, "test context")
 			switch {
 			case testCase.wantErr == nil && err != nil:
-				t.Errorf("validateURLAccessibility() error = %v, want nil", err)
+				t.Errorf("checkURL() error = %v, want nil", err)
 			case testCase.wantErr != nil && !errors.Is(err, testCase.wantErr):
-				t.Errorf("validateURLAccessibility() error = %v, want %v", err, testCase.wantErr)
+				t.Errorf("checkURL() error = %v, want %v", err, testCase.wantErr)
 			}
 		})
 	}
@@ -279,7 +306,7 @@ func TestValidateURLAccessibility(t *testing.T) {
 // destroyed live bookmarks behind bot protection.
 //
 //nolint:paralleltest // writes to the stats singleton
-func TestValidateURLAccessibility_RetriesRefusedHeadWithGet(t *testing.T) {
+func TestCheckURL_RetriesRefusedHeadWithGet(t *testing.T) {
 	resetStats(t)
 
 	server := httptest.NewServer(http.HandlerFunc(
@@ -293,8 +320,8 @@ func TestValidateURLAccessibility_RetriesRefusedHeadWithGet(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	if err := validateURLAccessibility(server.URL, "test context"); err != nil {
-		t.Errorf("validateURLAccessibility() error = %v, want nil when GET succeeds", err)
+	if _, err := checkURL(server.URL, "test context"); err != nil {
+		t.Errorf("checkURL() error = %v, want nil when GET succeeds", err)
 	}
 }
 
@@ -302,14 +329,14 @@ func TestValidateURLAccessibility_RetriesRefusedHeadWithGet(t *testing.T) {
 // this tool's limitation, not evidence the bookmark is gone.
 //
 //nolint:paralleltest // writes to the stats singleton
-func TestValidateURLAccessibility_TransportFailureIsUnverifiable(t *testing.T) {
+func TestCheckURL_TransportFailureIsUnverifiable(t *testing.T) {
 	resetStats(t)
 
 	server := staticServer(t, http.StatusOK, "")
 	unreachable := server.URL
 	server.Close()
 
-	err := validateURLAccessibility(unreachable, "test context")
+	_, err := checkURL(unreachable, "test context")
 	if !errors.Is(err, errUnverifiable) {
 		t.Errorf("error = %v, want errUnverifiable", err)
 	}

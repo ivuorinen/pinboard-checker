@@ -43,6 +43,7 @@ func TestREADME_QuotesCurrentConstants(t *testing.T) {
 		{"rate limit", "1 request per 3 seconds", defaultRateLimit.String()},
 		{"backoff ceiling", "60-second ceiling", maxRateLimit.String()},
 		{"request timeout", "15 seconds", defaultHTTPTimeout.String()},
+		{"per-host interval", "500ms apart", defaultPerHostInterval.String()},
 	}
 
 	for _, testCase := range tests {
@@ -84,21 +85,19 @@ func TestREADME_DocumentsEveryFlag(t *testing.T) {
 
 	readme := readmeText(t)
 
-	// The flags are registered by main(), which the test binary does not call,
-	// so register them against a throwaway FlagSet built the same way.
+	// Registered through the same function cli() uses, so this test cannot
+	// drift from the real flag set the way a hand-copied list did. The four
+	// toggles cli binds to package globals are added here the same way.
 	var (
 		probe                                     = flag.NewFlagSet("probe", flag.ContinueOnError)
 		verboseF, ciF, skipTitlesF, skipAutoTagsF bool
 	)
 
-	probe.String("token", "", "")
-	probe.Bool("dry-run", false, "")
-	probe.Duration("timeout", defaultHTTPTimeout, "")
+	registerFlags(probe)
 	probe.BoolVar(&verboseF, "verbose", false, "")
 	probe.BoolVar(&ciF, "ci", false, "")
 	probe.BoolVar(&skipTitlesF, "skip-titles", false, "")
 	probe.BoolVar(&skipAutoTagsF, "skip-auto-tags", false, "")
-	probe.Int("workers", 10, "")
 
 	probe.VisitAll(func(f *flag.Flag) {
 		if !strings.Contains(readme, "`-"+f.Name) {
@@ -164,8 +163,12 @@ func TestREADME_HasNoRetiredClaims(t *testing.T) {
 
 	retired := map[string]string{
 		"Checks if the URL is accessible": "the liveness check runs after the repair steps, not before",
-		"2xx/3xx":                         "only a 4xx is treated as dead; 5xx keeps the bookmark",
+		"2xx/3xx":                         "only 404 and 410 are treated as dead",
 		"See LICENSE file for details":    "the README names the license directly",
+		// The blanket 4xx rule deleted bookmarks over 429 and 408, which are the
+		// server throttling this tool, not the page being gone.
+		"4xx errors (404, 410, etc.)": "only 404 and 410 delete; every other 4xx is skipped",
+		"a definite 4xx":              "only 404 and 410 delete; every other 4xx is skipped",
 	}
 
 	for phrase, why := range retired {
