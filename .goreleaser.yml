@@ -1,0 +1,184 @@
+---
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=jcroql
+# GoReleaser configuration
+# Documentation: https://goreleaser.com/customization/
+version: 2
+
+project_name: pinboard-checker
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pinboard-checker
+    main: .
+    binary: pinboard-checker
+
+    # `version` in main is a plain uninitialized string so -X can patch it --
+    # cmd/link only patches a variable that is uninitialized or set to a
+    # constant, so giving it a function initializer makes this a silent no-op.
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+    goos:
+      - linux
+      - darwin
+      - windows
+      - freebsd
+
+    goarch:
+      - amd64
+      - arm64
+      - arm
+      - "386"
+
+    goarm:
+      - "6"
+      - "7"
+
+    ignore:
+      - goos: darwin
+        goarch: "386"
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+
+    env:
+      - CGO_ENABLED=0
+
+    # The binary makes outbound HTTPS calls, so it needs a resolver and a cert
+    # pool that work without glibc's NSS.
+    tags:
+      - netgo
+      - osusergo
+
+archives:
+  - id: pinboard-checker
+    formats: ["binary", "tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+
+    # Do NOT add a docs/* glob here: docs/ holds the audit findings store, so the
+    # glob would ship the project's own defect log to everyone downloading a
+    # tarball.
+    files:
+      - LICENSE
+      # Required by the BSD-3 dependencies (golang.org/x/net, x/sys, x/term)
+      # linked into the binary; LICENSE is the project's own MIT terms and does
+      # not cover them. Regenerate with `just notices` when the module set
+      # changes.
+      - THIRD_PARTY_NOTICES.md
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Keyless-sign the checksums file with cosign via Sigstore (Fulcio + Rekor). The
+# OIDC identity comes from the workflow's id-token; no long-lived keys are stored.
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+# Generate SBOMs for the release archives with syft.
+sboms:
+  - id: archive
+    artifacts: archive
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+release:
+  github:
+    owner: ivuorinen
+    name: pinboard-checker
+
+  header: |
+    ## pinboard-checker v{{ .Version }} ({{ .Date }})
+
+    Checks and repairs Pinboard bookmarks: expands shortened URLs, follows
+    redirects, fills in missing titles and tags, and reports dead links.
+
+  footer: |
+    ## Installation
+
+    ### Using Go
+    ```bash
+    go install github.com/ivuorinen/pinboard-checker@latest
+    ```
+
+    ### Manual Download
+    Download the appropriate binary for your platform from the assets below.
+
+    ## Documentation
+
+    See the [README](https://github.com/ivuorinen/pinboard-checker#readme) for
+    usage instructions.
+
+  make_latest: true
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "typo"
+      - "Merge pull request"
+      - "Merge branch"
+  groups:
+    - title: "🚀 Features"
+      regexp: "^feat"
+    - title: "🐛 Bug Fixes"
+      regexp: "^fix"
+    - title: "🔒 Security"
+      regexp: "^security"
+    - title: "⚡ Performance"
+      regexp: "^perf"
+    - title: "♻️ Refactoring"
+      regexp: "^refactor"
+    - title: "Other changes"
+
+nfpms:
+  - id: pinboard-checker
+    package_name: pinboard-checker
+    vendor: ivuorinen
+    homepage: https://github.com/ivuorinen/pinboard-checker
+    maintainer: ivuorinen
+    description: Checks and repairs the bookmarks in a Pinboard account
+    license: MIT
+
+    formats:
+      - deb
+      - rpm
+      - apk
+
+    bindir: /usr/bin
+
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/pinboard-checker/LICENSE
+      - src: ./THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/pinboard-checker/THIRD_PARTY_NOTICES.md
+      - src: ./README.md
+        dst: /usr/share/doc/pinboard-checker/README.md
+
+announce:
+  skip: false

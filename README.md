@@ -37,7 +37,18 @@ go install github.com/ivuorinen/pinboard-checker@latest
 ### From Release
 
 Download the latest binary for your platform from the
-[releases page](https://github.com/ivuorinen/pinboard-checker/releases).
+[releases page](https://github.com/ivuorinen/pinboard-checker/releases). Every
+release ships archives, `.deb`/`.rpm`/`.apk` packages, SBOMs, and a
+`checksums.txt` signed keylessly with [cosign](https://github.com/sigstore/cosign):
+
+```bash
+cosign verify-blob \
+  --certificate checksums.txt.pem \
+  --signature checksums.txt.sig \
+  --certificate-identity-regexp 'https://github.com/ivuorinen/pinboard-checker/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+```
 
 ## Configuration
 
@@ -137,6 +148,7 @@ pinboard-checker -ci
 - `-skip-auto-tags`: Skip auto-tagging bookmarks without tags (default: false)
 - `-workers int`: Number of concurrent workers (default: 10, allowed range: 1-100)
 - `-timeout duration`: Per-request HTTP timeout (default: 15s)
+- `-version`: Print the version and exit
 
 ## How It Works
 

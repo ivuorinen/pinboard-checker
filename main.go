@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -158,6 +159,11 @@ type BookmarkAction struct {
 	Error    error
 }
 
+// version is stamped by GoReleaser via -X main.version. It must stay a plain
+// uninitialized string: cmd/link only patches a variable that is uninitialized
+// or set to a constant, so a function initializer would make -X a silent no-op.
+var version string
+
 var (
 	verbose      bool
 	ciMode       bool
@@ -186,7 +192,14 @@ func main() {
 	flag.BoolVar(&skipTitles, "skip-titles", false, "Skip fetching titles for bookmarks without them")
 	flag.BoolVar(&skipAutoTags, "skip-auto-tags", false, "Skip auto-tagging bookmarks without tags")
 	workers := flag.Int("workers", 10, "Number of concurrent workers (1-100)")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionString())
+
+		return
+	}
 
 	token := *apiToken
 	if token == "" {
@@ -200,6 +213,20 @@ func main() {
 	setHTTPTimeout(*timeout)
 
 	os.Exit(run(token, *workers, *dryRun))
+}
+
+// versionString reports the release version. Only GoReleaser sets it; a
+// `go install`ed or `go build`ed binary has an empty version, so fall back to
+// the module version the toolchain stamps into the build info.
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return info.Main.Version
+	}
+
+	return "dev"
 }
 
 // validateFlags returns a non-zero exit code for any invalid combination.
