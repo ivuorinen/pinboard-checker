@@ -1,3 +1,5 @@
 pinboard-checker
 .env
 *.out
+dist/
+coverage.html

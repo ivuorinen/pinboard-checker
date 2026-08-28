@@ -1057,3 +1057,22 @@ func TestProcessBookmarksParallel(t *testing.T) {
 		})
 	}
 }
+
+// TestVersionString covers the ldflags path: an empty `version` must fall back
+// to build info rather than reporting an empty version, and a stamped one wins.
+func TestVersionString(t *testing.T) { //nolint:paralleltest // mutates the package-level version
+	original := version
+	t.Cleanup(func() { version = original })
+
+	version = "1.2.3"
+
+	if got := versionString(); got != "1.2.3" {
+		t.Errorf("versionString() = %q, want the stamped version", got)
+	}
+
+	version = ""
+
+	if got := versionString(); got == "" {
+		t.Error("versionString() = empty, want a build-info fallback")
+	}
+}

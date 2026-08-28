@@ -1,0 +1,41 @@
+# Tool versions for this repository.
+#
+# Every tool the repo actually invokes -- from the Justfile, .goreleaser.yml and
+# .github/workflows/ -- pinned so a local run matches CI. When a version here
+# mirrors a pin elsewhere in the repo, the comment says where; bump both or the
+# two will silently disagree.
+#
+# Tasks live in the Justfile (`just --list`), not here.
+
+[tools]
+
+# --- language toolchain -------------------------------------------------------
+# Must match the `toolchain` line in go.mod -- not the `go` directive, which is
+# the *minimum* language version the code builds against (1.25.0, the floor the
+# golang.org/x deps set). CI resolves the same toolchain via go-version-file.
+go = "1.27.0"
+
+# --- Go static analysis --------------------------------------------------------
+# Matches the version pinned in .github/workflows/go.yml's golangci-lint-action.
+golangci-lint = "2.13.1"
+
+# --- build and release ---------------------------------------------------------
+just = "1.58.0"
+# release.yml pins the action to "~> v2", so any v2 is acceptable.
+# Held at 2.17.0 deliberately: 2.18.0 fails mise's provenance check, because
+# upstream now signs releases as "https://dotcom.releases.github.com" while aqua
+# still expects "goreleaser/goreleaser/.github/workflows/release.yml".
+goreleaser = "2.17.0"
+# goreleaser shells out to these during `just release`: `signs.cmd: cosign` and
+# the `sboms` block (syft). Without them a local snapshot skips or fails those
+# stages, so it would not exercise what CI does.
+# cosign matches the `cosign-release` pinned in .github/workflows/release.yml.
+cosign = "2.6.5"
+syft = "1.51.0"
+
+[settings]
+# Every tool here is pinned explicitly, so mise has no reason to also read a
+# version out of go.mod. Reading it is deprecated anyway (mise removes the
+# go.mod `go` directive as a version source in 2026.11.0): that directive is a
+# minimum compatible version, not the version the project is built with.
+idiomatic_version_file_enable_tools = []

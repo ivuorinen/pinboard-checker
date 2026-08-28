@@ -1,31 +1,51 @@
-on:
-  release:
-    types: [created]
+---
+name: Release
 
-# Release assets only; nothing here publishes a package.
-permissions:
-    contents: write
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+# One release per tag; never cancel a release that is mid-publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  releases-matrix:
-    name: Release Go Binary
+  release:
+    name: Release
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # build and publish in parallel: linux/386, linux/amd64, linux/arm64, windows/386, windows/amd64, darwin/amd64, darwin/arm64
-        goos: [linux, windows, darwin]
-        goarch: ["386", amd64, arm64]
-        exclude:
-          - goarch: "386"
-            goos: darwin
-          - goarch: arm64
-            goos: windows
+    permissions:
+      contents: write # create the GitHub release and upload artifacts
+      id-token: write # OIDC token for keyless cosign/Sigstore signing
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-    - uses: wangyoucao577/go-release-action@279495102627de7960cbc33434ab01a12bae144b # v1
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        goos: ${{ matrix.goos }}
-        goarch: ${{ matrix.goarch }}
-        binary_name: "pinboard-checker"
-        extra_files: LICENSE README.md
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false # GoReleaser authenticates via GITHUB_TOKEN, not the persisted git credential
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: false # release builds must not trust a cache poisonable from lower-privilege runs
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.6.5"
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2" # pin the major version; avoids surprise breakage from a new GoReleaser major
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
