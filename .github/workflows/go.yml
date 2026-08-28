@@ -36,6 +36,11 @@ jobs:
     - name: Test
       run: go test -race -coverprofile=coverage.out ./...
 
+    # The suite covers every statement, so a drop means a new branch arrived
+    # untested. Printing the number never caught that; failing on it does.
+    - name: Coverage gate
+      run: ./scripts/coverage-gate.sh coverage.out 100
+
   lint:
     runs-on: ubuntu-latest
     steps:
