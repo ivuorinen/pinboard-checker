@@ -20,10 +20,11 @@ lint:
 test:
     go test -race ./...
 
-# Run tests with coverage; writes coverage.out and the HTML report
+# Run tests with coverage; writes coverage.out and the HTML report, and fails
+# below 100%. Blocks marked `// coverage:ignore` are excluded; see the script.
 coverage:
     go test -race -coverprofile=coverage.out ./...
-    go tool cover -func=coverage.out | tail -1
+    ./scripts/coverage-gate.sh coverage.out 100
     go tool cover -html=coverage.out -o coverage.html
 
 # Build the binary
