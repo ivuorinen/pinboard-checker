@@ -17,7 +17,7 @@ go = "1.27.0"
 
 # --- Go static analysis --------------------------------------------------------
 # Matches the version pinned in .github/workflows/go.yml's golangci-lint-action.
-golangci-lint = "2.13.1"
+golangci-lint = "2.13.2"
 
 # --- build and release ---------------------------------------------------------
 just = "1.58.0"
