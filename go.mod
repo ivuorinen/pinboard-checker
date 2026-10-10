@@ -7,7 +7,7 @@ toolchain go1.27.2
 require (
 	github.com/joho/godotenv v1.5.1
 	github.com/schollz/progressbar/v3 v3.19.1
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 )
 
 require (
