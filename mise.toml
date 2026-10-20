@@ -20,7 +20,7 @@ go = "1.27.2"
 golangci-lint = "2.14.0"
 
 # --- build and release ---------------------------------------------------------
-just = "1.58.0"
+just = "1.59.0"
 # release.yml pins the action to "~> v2", so any v2 is acceptable.
 # Held at 2.17.0 deliberately: 2.18.0 fails mise's provenance check, because
 # upstream now signs releases as "https://dotcom.releases.github.com" while aqua
