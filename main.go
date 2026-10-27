@@ -355,10 +355,11 @@ type checker struct {
 	applyBar *progressBar
 
 	// knownURLs holds every URL the account holds. run fills it from posts/all
-	// and the sequential apply phase adds each URL it writes, so a second
-	// bookmark moving to the same new address is merged rather than written
-	// over the first: posts/add with replace=yes overwrites the whole entry,
-	// notes and tags included. Phase one never reads it, so it needs no mutex.
+	// and the sequential apply phase adds each URL it writes and removes each
+	// one it deletes, so a second bookmark moving to the same new address is
+	// merged rather than written over the first: posts/add with replace=yes
+	// overwrites the whole entry, notes and tags included. Phase one never
+	// reads it, so it needs no mutex.
 	knownURLs map[string]bool
 }
 
@@ -1311,10 +1312,15 @@ func (c *checker) applyUpdateAction(action BookmarkAction) {
 		outcome = c.applyUpdateWrite(action)
 	case target != action.Original.URL && c.knownURLs[target]:
 		outcome = outcomeMerged
+		delete(c.knownURLs, action.Original.URL)
 	default:
 		outcome = outcomeUpdated
-		// Mirror the real run, which records each URL it writes, so a second
-		// bookmark moving to the same address previews as the merge it is.
+		// Mirror the real run, which forgets each URL it deletes and records
+		// each one it writes, so a second bookmark moving to the same address
+		// previews as the merge it is, and one moving onto a deleted address
+		// previews as a write. Forget first: an in-place update's target is its
+		// own URL, which must stay known.
+		delete(c.knownURLs, action.Original.URL)
 		c.knownURLs[target] = true
 	}
 
@@ -1364,6 +1370,9 @@ func (c *checker) narrateUpdate(action BookmarkAction, target string, outcome wr
 
 func (c *checker) applyDeleteAction(action BookmarkAction) {
 	if c.dryRun {
+		// The real run forgets the URL in deleteBookmark; see applyUpdateAction.
+		delete(c.knownURLs, action.Original.URL)
+
 		if c.verbose {
 			fmt.Fprintf(c.out, "Would delete: %s (error: %v)\n", action.Original.URL, action.Error)
 		}
@@ -1487,9 +1496,18 @@ func (c *checker) recordDeletion(reason string, b Bookmark) {
 	fmt.Fprintf(c.errOut, "deleted (%s): %s\n", reason, addParams(b).Encode())
 }
 
-// deleteBookmark removes a bookmark from Pinboard.
+// deleteBookmark removes a bookmark from Pinboard, and its URL from knownURLs.
+// Every delete of the apply phase comes through here. Left in the map, a
+// deleted URL turned a later bookmark moving onto it into a merge with an entry
+// that no longer existed, and that bookmark was deleted too.
 func (c *checker) deleteBookmark(urlStr string) error {
-	return c.pinboardWrite("/posts/delete", url.Values{paramURL: {urlStr}})
+	if err := c.pinboardWrite("/posts/delete", url.Values{paramURL: {urlStr}}); err != nil {
+		return err
+	}
+
+	delete(c.knownURLs, urlStr)
+
+	return nil
 }
 
 // getPageTitle fetches a URL and extracts its <title>. It returns an empty

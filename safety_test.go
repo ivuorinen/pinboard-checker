@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -595,6 +596,100 @@ func TestApplyUpdateWrite_NewTargetIsWritten(t *testing.T) {
 	// The written URL now counts as held, so a later mover to it merges.
 	if !chk.knownURLs[testNewURL] {
 		t.Error("knownURLs lacks the URL just written")
+	}
+}
+
+// A deleted URL leaves knownURLs. A failed delete leaves the bookmark, so its
+// URL stays.
+func TestDeleteBookmark_ForgetsTheURLOnlyOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	chk := newWriteChecker(t, okServer(t).URL)
+	chk.knownURLs = map[string]bool{testURL: true}
+
+	if err := chk.deleteBookmark(testURL); err != nil {
+		t.Fatalf("deleteBookmark() error = %v, want nil", err)
+	}
+	if chk.knownURLs[testURL] {
+		t.Error("knownURLs still holds the deleted URL")
+	}
+
+	failing := newWriteChecker(t,
+		staticServer(t, http.StatusOK, `{"result_code":"item not found"}`).URL)
+	failing.knownURLs = map[string]bool{testURL: true}
+
+	if err := failing.deleteBookmark(testURL); err == nil {
+		t.Fatal("deleteBookmark() error = nil, want the rejected delete")
+	}
+	if !failing.knownURLs[testURL] {
+		t.Error("a rejected delete dropped the URL from knownURLs")
+	}
+}
+
+// One bookmark merges away from A, then another moves onto A. A no longer
+// exists, so the second must be written there; merged instead, it was deleted
+// as a duplicate of an entry that was already gone.
+func TestApplyBookmarkActions_MoveOntoDeletedURLIsWritten(t *testing.T) {
+	t.Parallel()
+
+	const moved = "http://example.net/moved"
+
+	rec := okServer(t)
+	chk := newWriteChecker(t, rec.URL)
+	chk.knownURLs = map[string]bool{testURL: true, testNewURL: true, moved: true}
+
+	chk.applyBookmarkActions([]BookmarkAction{
+		{Original: Bookmark{URL: testURL}, Action: ActionUpdate, NewURL: testNewURL},
+		{Original: Bookmark{URL: moved}, Action: ActionUpdate, NewURL: testURL},
+	})
+
+	if chk.stats.Merged != 1 || chk.stats.UpdatesPerformed != 1 {
+		t.Errorf("Merged = %d, UpdatesPerformed = %d; want 1 merge, then 1 write",
+			chk.stats.Merged, chk.stats.UpdatesPerformed)
+	}
+
+	wroteAtA := false
+	for _, request := range rec.Requests() {
+		if strings.HasPrefix(request, "/posts/add?") &&
+			strings.Contains(request, url.Values{paramURL: {testURL}}.Encode()) {
+			wroteAtA = true
+		}
+	}
+	if !wroteAtA {
+		t.Errorf("no posts/add for %s; requests: %v", testURL, rec.Requests())
+	}
+}
+
+// A dry run previews the same decisions: the URLs it would delete leave
+// knownURLs, so the second mover previews as a write, not a merge.
+func TestApplyBookmarkActions_DryRunForgetsDeletedURLs(t *testing.T) {
+	t.Parallel()
+
+	const moved = "http://example.net/moved"
+
+	chk := newTestChecker(t)
+	chk.dryRun, chk.verbose = true, true
+	chk.knownURLs = map[string]bool{
+		testURL: true, testNewURL: true, moved: true, testFinalURL: true,
+	}
+
+	chk.applyBookmarkActions([]BookmarkAction{
+		{Original: Bookmark{URL: testURL}, Action: ActionUpdate, NewURL: testNewURL},
+		{Original: Bookmark{URL: moved}, Action: ActionUpdate, NewURL: testURL},
+		{Original: Bookmark{URL: testFinalURL}, Action: ActionDelete},
+		// In place: its target is its own URL, which stays known.
+		{Original: Bookmark{URL: testNewURL}, Action: ActionUpdate, NewTitle: testTitle},
+	})
+
+	if merges := strings.Count(stdoutOf(chk), "Would merge:"); merges != 1 {
+		t.Errorf("previewed %d merges, want 1; output:\n%s", merges, stdoutOf(chk))
+	}
+	for gone, want := range map[string]bool{
+		moved: false, testURL: true, testFinalURL: false, testNewURL: true,
+	} {
+		if chk.knownURLs[gone] != want {
+			t.Errorf("knownURLs[%s] = %v, want %v", gone, chk.knownURLs[gone], want)
+		}
 	}
 }
 
