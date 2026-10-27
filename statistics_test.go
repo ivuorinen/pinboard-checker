@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -18,9 +16,7 @@ var errTestFetch = errors.New("fetch failed")
 func TestRecordAction_NoChange(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	action := BookmarkAction{
@@ -41,9 +37,7 @@ func TestRecordAction_NoChange(t *testing.T) {
 func TestRecordAction_Update(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	action := BookmarkAction{
@@ -73,9 +67,7 @@ func TestRecordAction_Update(t *testing.T) {
 func TestRecordAction_UpdateSameURL(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	action := BookmarkAction{
@@ -98,9 +90,7 @@ func TestRecordAction_UpdateSameURL(t *testing.T) {
 func TestRecordAction_Delete(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	action := BookmarkAction{
@@ -122,9 +112,7 @@ func TestRecordAction_Delete(t *testing.T) {
 func TestRecordHTTPStatus(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.RecordHTTPStatus("url-validation", 200)
@@ -143,36 +131,10 @@ func TestRecordHTTPStatus(t *testing.T) {
 	}
 }
 
-func TestRecordShortenerExpansion(t *testing.T) {
-	t.Parallel()
-	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-	}
-
-	stats.RecordShortenerExpansion("bitly", true)
-	stats.RecordShortenerExpansion("bitly", true)
-	stats.RecordShortenerExpansion("bitly", false)
-	stats.RecordShortenerExpansion("tinyurl", true)
-
-	if stats.ShortURLsExpanded["bitly"] != 2 {
-		t.Errorf("expected 2 bitly successes, got %d", stats.ShortURLsExpanded["bitly"])
-	}
-	if stats.ShortURLsFailed["bitly"] != 1 {
-		t.Errorf("expected 1 bitly failure, got %d", stats.ShortURLsFailed["bitly"])
-	}
-	if stats.ShortURLsExpanded["tinyurl"] != 1 {
-		t.Errorf("expected 1 tinyurl success, got %d", stats.ShortURLsExpanded["tinyurl"])
-	}
-}
-
 func TestIncrementParenthesesFixed(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.IncrementParenthesesFixed()
@@ -186,9 +148,7 @@ func TestIncrementParenthesesFixed(t *testing.T) {
 func TestIncrementRedirects(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.IncrementRedirects()
@@ -203,9 +163,7 @@ func TestIncrementRedirects(t *testing.T) {
 func TestRecordTitleFetch(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.RecordTitleFetch(true, nil)
@@ -228,9 +186,7 @@ func TestRecordTitleFetch(t *testing.T) {
 func TestRecordTagFetch(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.RecordTagFetch(true, nil)
@@ -254,9 +210,7 @@ func TestRecordTagFetch(t *testing.T) {
 func TestIncrementUpdates(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.IncrementUpdates()
@@ -270,9 +224,7 @@ func TestIncrementUpdates(t *testing.T) {
 func TestIncrementDeletions(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.IncrementDeletions()
@@ -285,9 +237,7 @@ func TestIncrementDeletions(t *testing.T) {
 func TestThreadSafety(t *testing.T) {
 	t.Parallel()
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	var wg sync.WaitGroup
@@ -336,18 +286,15 @@ func TestThreadSafety(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_EmptyStatistics(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	// Capture stdout
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Should contain the header
 	if !strings.Contains(output, "PROCESSING STATISTICS") {
@@ -365,11 +312,10 @@ func TestPrint_EmptyStatistics(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_WithData(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded:  make(map[string]int),
-		ShortURLsFailed:    make(map[string]int),
 		StatusCodes:        make(map[string]map[int]int),
 		TotalBookmarks:     100,
 		ActionNoChange:     80,
@@ -384,12 +330,9 @@ func TestPrint_WithData(t *testing.T) {
 		ProcessingDuration: 10 * time.Second,
 	}
 
-	stats.ShortURLsExpanded["bitly"] = 2
 	stats.RecordHTTPStatus("url-validation", 200)
 
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Check for key statistics
 	if !strings.Contains(output, "Total bookmarks:    100") {
@@ -407,24 +350,18 @@ func TestPrint_WithData(t *testing.T) {
 	if !strings.Contains(output, "API OPERATIONS") {
 		t.Error("expected output to contain API operations")
 	}
-	if !strings.Contains(output, "bit.ly") {
-		t.Error("expected output to contain shortener stats")
-	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_NoUpdatesBreakdown(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-		TotalBookmarks:    100,
-		ActionNoChange:    100,
+		StatusCodes:    make(map[string]map[int]int),
+		TotalBookmarks: 100,
+		ActionNoChange: 100,
 	}
 
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Should not contain updates breakdown if no updates
 	if strings.Contains(output, "UPDATES BREAKDOWN") {
@@ -432,18 +369,15 @@ func TestPrint_NoUpdatesBreakdown(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_NoURLProcessing(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-		TotalBookmarks:    100,
+		StatusCodes:    make(map[string]map[int]int),
+		TotalBookmarks: 100,
 	}
 
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Should not contain URL processing if none occurred
 	if strings.Contains(output, "URL PROCESSING") {
@@ -451,18 +385,15 @@ func TestPrint_NoURLProcessing(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_NoHTTPResponses(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-		TotalBookmarks:    100,
+		StatusCodes:    make(map[string]map[int]int),
+		TotalBookmarks: 100,
 	}
 
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Should not contain HTTP responses if none recorded
 	if strings.Contains(output, "HTTP RESPONSES") {
@@ -470,18 +401,15 @@ func TestPrint_NoHTTPResponses(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_NoAPIOperations(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-		TotalBookmarks:    100,
+		StatusCodes:    make(map[string]map[int]int),
+		TotalBookmarks: 100,
 	}
 
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Should not contain API operations if none occurred
 	if strings.Contains(output, "API OPERATIONS") {
@@ -489,21 +417,18 @@ func TestPrint_NoAPIOperations(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
 func TestPrint_HTTPOperationNames(t *testing.T) {
+	t.Parallel()
+
 	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
+		StatusCodes: make(map[string]map[int]int),
 	}
 
 	stats.RecordHTTPStatus("url-validation", 200)
 	stats.RecordHTTPStatus("title-fetch", 404)
 	stats.RecordHTTPStatus("tag-fetch", 200)
 
-	output := captureOutput(func() {
-		stats.Print()
-	})
+	output := render(stats.Print)
 
 	// Check that operation names are formatted correctly
 	if !strings.Contains(output, "URL Validation") {
@@ -517,42 +442,12 @@ func TestPrint_HTTPOperationNames(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot run in parallel - modifies global os.Stdout
-func TestPrint_AllShorteners(t *testing.T) {
-	stats := &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-	}
-
-	stats.ShortURLsExpanded["bitly"] = 5
-	stats.ShortURLsFailed["bitly"] = 1
-	stats.ShortURLsExpanded["tinyurl"] = 3
-	stats.ShortURLsExpanded["isgd"] = 2
-	stats.ShortURLsFailed["isgd"] = 1
-
-	output := captureOutput(func() {
-		stats.Print()
-	})
-
-	// Check that all shorteners are displayed
-	if !strings.Contains(output, "bit.ly") {
-		t.Error("expected output to contain bit.ly stats")
-	}
-	if !strings.Contains(output, "tinyurl") {
-		t.Error("expected output to contain tinyurl stats")
-	}
-	if !strings.Contains(output, "is.gd") {
-		t.Error("expected output to contain is.gd stats")
-	}
-}
-
 // Every conditional line in the API OPERATIONS block must render when its
 // counter is set. Each was added for a defect the report had previously hidden,
 // so a line that silently stopped printing would take the evidence with it.
-//
-//nolint:paralleltest // captureOutput swaps the global os.Stdout
 func TestPrintAPIOperations_RendersEveryCounter(t *testing.T) {
+	t.Parallel()
+
 	report := newStatistics()
 	report.TotalBookmarks = 1
 	report.TitlesFetched = 3
@@ -565,7 +460,7 @@ func TestPrintAPIOperations_RendersEveryCounter(t *testing.T) {
 	report.Merged = 8
 	report.ApplyErrors = 9
 
-	printed := captureOutput(report.Print)
+	printed := render(report.Print)
 
 	for _, want := range []string{
 		"Titles fetched:     3",
@@ -583,33 +478,12 @@ func TestPrintAPIOperations_RendersEveryCounter(t *testing.T) {
 	}
 }
 
-// captureOutput captures stdout during function execution.
-func captureOutput(printFunc func()) string {
-	old := os.Stdout
-	read, write, err := os.Pipe()
-	if err != nil {
-		panic(err)
-	}
-	os.Stdout = write
+// render returns what printFunc writes. It replaces a helper that swapped the
+// process-wide os.Stdout through a pipe, which kept every report test serial.
+func render(printFunc func(io.Writer)) string {
+	var buf strings.Builder
 
-	// Channel to hold the output
-	outChan := make(chan string)
+	printFunc(&buf)
 
-	// Copy the output in a separate goroutine
-	go func() {
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, read); err != nil {
-			panic(err)
-		}
-		outChan <- buf.String()
-	}()
-
-	printFunc()
-
-	if err := write.Close(); err != nil {
-		panic(err)
-	}
-	os.Stdout = old
-
-	return <-outChan
+	return buf.String()
 }

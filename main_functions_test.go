@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -261,7 +262,7 @@ func TestValidateFlags(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := validateFlags(testCase.token, testCase.workers,
+			got := validateFlags(io.Discard, testCase.token, testCase.workers,
 				testCase.timeout, testCase.hostInterval)
 			if got != testCase.want {
 				t.Errorf("validateFlags() = %d, want %d", got, testCase.want)
@@ -270,8 +271,9 @@ func TestValidateFlags(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // writes to the stats singleton via RecordHTTPStatus
 func TestCheckURL_Verdicts(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		statusCode int
@@ -287,11 +289,11 @@ func TestCheckURL_Verdicts(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
+			t.Parallel()
 
 			server := staticServer(t, testCase.statusCode, "")
 
-			_, err := checkURL(server.URL, "test context")
+			_, _, err := newTestChecker(t).checkURL(server.URL, "test context")
 			switch {
 			case testCase.wantErr == nil && err != nil:
 				t.Errorf("checkURL() error = %v, want nil", err)
@@ -304,10 +306,8 @@ func TestCheckURL_Verdicts(t *testing.T) {
 
 // A host that refuses HEAD is not a dead link. Deleting on the HEAD status
 // destroyed live bookmarks behind bot protection.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_RetriesRefusedHeadWithGet(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
@@ -320,23 +320,17 @@ func TestCheckURL_RetriesRefusedHeadWithGet(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	if _, err := checkURL(server.URL, "test context"); err != nil {
+	if _, _, err := newTestChecker(t).checkURL(server.URL, "test context"); err != nil {
 		t.Errorf("checkURL() error = %v, want nil when GET succeeds", err)
 	}
 }
 
 // A transport failure must be errUnverifiable, never errDeadLink: a timeout is
 // this tool's limitation, not evidence the bookmark is gone.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_TransportFailureIsUnverifiable(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, "")
-	unreachable := server.URL
-	server.Close()
-
-	_, err := checkURL(unreachable, "test context")
+	_, _, err := newTestChecker(t).checkURL(unreachableURL(t), "test context")
 	if !errors.Is(err, errUnverifiable) {
 		t.Errorf("error = %v, want errUnverifiable", err)
 	}
@@ -345,14 +339,46 @@ func TestCheckURL_TransportFailureIsUnverifiable(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // writes to the stats singleton
+// A balanced ")" belongs to the URL. Against a host that answers 200 for any
+// path, trimming it rewrote /wiki/Mercury_(planet) to a broken URL; the guard
+// must keep it without even asking the host.
+func TestFixParenthesesSuffix_KeepsBalancedParentheses(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusOK)
+		}))
+	t.Cleanup(server.Close)
+
+	chk := newTestChecker(t)
+
+	for _, path := range []string{"/wiki/Mercury_(planet)", "/search?q=f(x)"} {
+		original := server.URL + path
+
+		if got := chk.fixParenthesesSuffix(original); got != original {
+			t.Errorf("fixParenthesesSuffix(%q) = %q, want it unchanged", path, got)
+		}
+	}
+	if requests != 0 {
+		t.Errorf("issued %d requests, want 0 for balanced parentheses", requests)
+	}
+	if chk.stats.ParenthesesFixed != 0 {
+		t.Errorf("ParenthesesFixed = %d, want 0", chk.stats.ParenthesesFixed)
+	}
+}
+
 func TestExpandAndCheckURL(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	t.Run("returns the URL unchanged when nothing rewrites it", func(t *testing.T) {
+		t.Parallel()
+
 		server := staticServer(t, http.StatusOK, "")
 
-		got, err := expandAndCheckURL(server.URL, false)
+		got, err := newTestChecker(t).expandAndCheckURL(server.URL)
 		if err != nil {
 			t.Fatalf("expandAndCheckURL() error = %v, want nil", err)
 		}
@@ -362,27 +388,26 @@ func TestExpandAndCheckURL(t *testing.T) {
 	})
 
 	t.Run("reports a 404 as a dead link", func(t *testing.T) {
+		t.Parallel()
+
 		server := staticServer(t, http.StatusNotFound, "")
 
-		_, err := expandAndCheckURL(server.URL, false)
-		if !errors.Is(err, errDeadLink) {
+		if _, err := newTestChecker(t).expandAndCheckURL(server.URL); !errors.Is(err, errDeadLink) {
 			t.Errorf("expandAndCheckURL() error = %v, want errDeadLink", err)
 		}
 	})
 }
 
-// The common path — no shortener, no parenthesis, no redirect — used to issue
-// four requests for the same URL because every step re-validated regardless.
-//
-//nolint:paralleltest // writes to the stats singleton
+// The common path — no parenthesis, no redirect — used to issue four requests
+// for the same URL because every step re-validated regardless.
 func TestExpandAndCheckURL_DoesNotRevalidateUnchangedURL(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	rec := newRecordingServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	if _, err := expandAndCheckURL(rec.URL, false); err != nil {
+	if _, err := newTestChecker(t).expandAndCheckURL(rec.URL); err != nil {
 		t.Fatalf("expandAndCheckURL() error = %v, want nil", err)
 	}
 
@@ -392,11 +417,12 @@ func TestExpandAndCheckURL_DoesNotRevalidateUnchangedURL(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // writes to the stats singleton
 func TestFixParenthesesSuffix(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	t.Run("drops the parenthesis when the trimmed URL works", func(t *testing.T) {
+		t.Parallel()
+
 		server := httptest.NewServer(http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.RequestURI, ")") {
@@ -410,41 +436,33 @@ func TestFixParenthesesSuffix(t *testing.T) {
 
 		withParen := server.URL + "/page)"
 
-		got, err := fixParenthesesSuffix(withParen, false)
-		if err != nil {
-			t.Fatalf("fixParenthesesSuffix() error = %v, want nil", err)
-		}
-		if got != server.URL+"/page" {
+		if got := newTestChecker(t).fixParenthesesSuffix(withParen); got != server.URL+"/page" {
 			t.Errorf("fixParenthesesSuffix() = %q, want the trimmed URL", got)
 		}
 	})
 
 	t.Run("keeps the parenthesis when trimming does not help", func(t *testing.T) {
-		server := staticServer(t, http.StatusNotFound, "")
-		withParen := server.URL + "/page)"
+		t.Parallel()
 
-		got, err := fixParenthesesSuffix(withParen, false)
-		if err != nil {
-			t.Fatalf("fixParenthesesSuffix() error = %v, want nil", err)
-		}
-		if got != withParen {
+		withParen := staticServer(t, http.StatusNotFound, "").URL + "/page)"
+
+		if got := newTestChecker(t).fixParenthesesSuffix(withParen); got != withParen {
 			t.Errorf("fixParenthesesSuffix() = %q, want %q", got, withParen)
 		}
 	})
 
 	t.Run("leaves a URL without a parenthesis alone", func(t *testing.T) {
-		got, err := fixParenthesesSuffix(testURL, false)
-		if err != nil {
-			t.Fatalf("fixParenthesesSuffix() error = %v, want nil", err)
-		}
-		if got != testURL {
+		t.Parallel()
+
+		if got := newTestChecker(t).fixParenthesesSuffix(testURL); got != testURL {
 			t.Errorf("fixParenthesesSuffix() = %q, want %q", got, testURL)
 		}
 	})
 }
 
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_Redirects(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name     string
 		status   int
@@ -452,12 +470,16 @@ func TestCheckURL_Redirects(t *testing.T) {
 		// want is resolved against the server URL when relative is true.
 		want     string
 		relative bool
+		// permanent is the verdict that decides whether the target may be
+		// written back; only 301 and 308 move a resource for good.
+		permanent bool
 	}{
 		{
-			name:     "301",
-			status:   http.StatusMovedPermanently,
-			location: testFinalURL,
-			want:     testFinalURL,
+			name:      "301",
+			status:    http.StatusMovedPermanently,
+			location:  testFinalURL,
+			want:      testFinalURL,
+			permanent: true,
 		},
 		{
 			name:     "302",
@@ -479,24 +501,26 @@ func TestCheckURL_Redirects(t *testing.T) {
 			want:     testFinalURL,
 		},
 		{
-			name:     "308",
-			status:   http.StatusPermanentRedirect,
-			location: testFinalURL,
-			want:     testFinalURL,
+			name:      "308",
+			status:    http.StatusPermanentRedirect,
+			location:  testFinalURL,
+			want:      testFinalURL,
+			permanent: true,
 		},
 		{
 			// The raw header used to be stored verbatim, so "/moved" became the
 			// bookmark URL and the bookmark was then deleted as unreachable.
-			name:     "relative Location is resolved",
-			status:   http.StatusMovedPermanently,
-			location: "/moved",
-			relative: true,
+			name:      "relative Location is resolved",
+			status:    http.StatusMovedPermanently,
+			location:  "/moved",
+			relative:  true,
+			permanent: true,
 		},
 	}
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
+			t.Parallel()
 
 			server := httptest.NewServer(http.HandlerFunc(
 				func(w http.ResponseWriter, _ *http.Request) {
@@ -510,47 +534,47 @@ func TestCheckURL_Redirects(t *testing.T) {
 				want = server.URL + testCase.location
 			}
 
-			got, err := checkURL(server.URL, "test context")
+			got, permanent, err := newTestChecker(t).checkURL(server.URL, "test context")
 			if err != nil {
 				t.Fatalf("checkURL() error = %v, want nil", err)
 			}
 			if got != want {
 				t.Errorf("checkURL() redirect = %q, want %q", got, want)
 			}
+			if permanent != testCase.permanent {
+				t.Errorf("checkURL() permanent = %v, want %v", permanent, testCase.permanent)
+			}
 		})
 	}
 }
 
 // An empty redirect means the URL is final.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_NoRedirect(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusOK, "")
+	chk := newTestChecker(t)
 
-	got, err := checkURL(server.URL, "test context")
+	got, _, err := chk.checkURL(server.URL, "test context")
 	if err != nil {
 		t.Fatalf("checkURL() error = %v, want nil", err)
 	}
 	if got != "" {
 		t.Errorf("checkURL() redirect = %q, want empty for a final URL", got)
 	}
-	if stats.Redirects != 0 {
-		t.Errorf("recorded %d redirects, want 0", stats.Redirects)
+	if chk.stats.Redirects != 0 {
+		t.Errorf("recorded %d redirects, want 0", chk.stats.Redirects)
 	}
 }
 
 // A redirect status with no Location header leaves the URL final rather than
 // erroring.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_RedirectWithoutLocation(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusMovedPermanently, "")
 
-	got, err := checkURL(server.URL, "test context")
+	got, _, err := newTestChecker(t).checkURL(server.URL, "test context")
 	if err != nil {
 		t.Fatalf("checkURL() error = %v, want nil", err)
 	}
@@ -561,10 +585,8 @@ func TestCheckURL_RedirectWithoutLocation(t *testing.T) {
 
 // followRedirects walks a chain rather than resolving only the first hop, which
 // left a bookmark pointing at an intermediate URL.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestFollowRedirects_WalksChain(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	final := staticServer(t, http.StatusOK, "")
 
@@ -588,7 +610,9 @@ func TestFollowRedirects_WalksChain(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	got, err := followRedirects(server.URL+"/one", false)
+	chk := newTestChecker(t)
+
+	got, err := chk.followRedirects(server.URL + "/one")
 	if err != nil {
 		t.Fatalf("followRedirects() error = %v, want nil", err)
 	}
@@ -598,16 +622,15 @@ func TestFollowRedirects_WalksChain(t *testing.T) {
 	if hops != 2 {
 		t.Errorf("walked %d hops, want 2", hops)
 	}
-	if stats.Redirects != 2 {
-		t.Errorf("recorded %d redirects, want 2", stats.Redirects)
+	if chk.stats.Redirects != 2 {
+		t.Errorf("recorded %d redirects, want 2", chk.stats.Redirects)
 	}
 }
 
-// A redirect cycle must stop at the hop limit rather than loop forever.
-//
-//nolint:paralleltest // writes to the stats singleton
+// A redirect cycle must stop at the hop limit rather than loop forever, and
+// the bookmark is unverifiable there: the chain's end was never requested.
 func TestFollowRedirects_StopsAtHopLimit(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	var server *httptest.Server
 
@@ -617,39 +640,167 @@ func TestFollowRedirects_StopsAtHopLimit(t *testing.T) {
 			requests++
 			// Points at itself under a fresh path so every hop is distinct.
 			w.Header().Set("Location", server.URL+"/next")
+			w.WriteHeader(http.StatusMovedPermanently)
+		}))
+	t.Cleanup(server.Close)
+
+	got, err := newTestChecker(t).followRedirects(server.URL)
+	if !errors.Is(err, errUnverifiable) {
+		t.Fatalf("followRedirects() = %q, %v; want errUnverifiable at the hop limit", got, err)
+	}
+	if requests != maxRedirectHops {
+		t.Errorf("issued %d requests, want %d", requests, maxRedirectHops)
+	}
+}
+
+// Two bookmarks that permanently redirect to each other used to be written onto
+// each other's URL; the apply phase then merged one into the other and deleted
+// both. Each is now skipped, so nothing is written or deleted.
+func TestProcessBookmark_PermanentCycleIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			target := "/a"
+			if r.URL.Path == "/a" {
+				target = "/b"
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		}))
+	t.Cleanup(server.Close)
+
+	chk := newTestChecker(t)
+
+	for _, path := range []string{"/a", "/b"} {
+		action := chk.processBookmark(Bookmark{URL: server.URL + path, Title: "t", Tags: "x"})
+		if action.Action != ActionNoChange || !errors.Is(action.Error, errUnverifiable) {
+			t.Errorf("processBookmark(%s) = action %d, error %v; want a skip", path,
+				action.Action, action.Error)
+		}
+	}
+	if chk.stats.Skipped != 2 {
+		t.Errorf("Skipped = %d, want 2", chk.stats.Skipped)
+	}
+}
+
+// A login wall answers an anonymous request with a temporary redirect. Writing
+// its target back replaced every session-gated bookmark with the login page, so
+// the chain is still walked for liveness but the bookmark keeps its URL.
+func TestFollowRedirects_KeepsURLBehindTemporaryRedirect(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{
+		http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/login" {
+						w.WriteHeader(http.StatusOK)
+
+						return
+					}
+					w.Header().Set("Location", "/login")
+					w.WriteHeader(status)
+				}))
+			t.Cleanup(server.Close)
+
+			bookmark := server.URL + "/private/doc"
+			chk := newTestChecker(t)
+
+			got, err := chk.followRedirects(bookmark)
+			if err != nil {
+				t.Fatalf("followRedirects() error = %v, want nil", err)
+			}
+			if got != bookmark {
+				t.Errorf("followRedirects() = %q, want the bookmark kept at %q", got, bookmark)
+			}
+			if chk.stats.Redirects != 1 {
+				t.Errorf("recorded %d redirects, want 1: the hop is still followed",
+					chk.stats.Redirects)
+			}
+		})
+	}
+}
+
+// The rewrite advances through permanent hops and stops at the first temporary
+// one: 301 -> 302 -> 200 leaves the bookmark at the 301 target.
+func TestFollowRedirects_RewriteStopsAtFirstTemporaryHop(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/old":
+				w.Header().Set("Location", "/new")
+				w.WriteHeader(http.StatusMovedPermanently)
+			case "/new":
+				w.Header().Set("Location", "/login")
+				w.WriteHeader(http.StatusFound)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+	t.Cleanup(server.Close)
+
+	chk := newTestChecker(t)
+	chk.verbose = true
+
+	got, err := chk.followRedirects(server.URL + "/old")
+	if err != nil {
+		t.Fatalf("followRedirects() error = %v, want nil", err)
+	}
+	if want := server.URL + "/new"; got != want {
+		t.Errorf("followRedirects() = %q, want the permanent target %q", got, want)
+	}
+	if output := stdoutOf(chk); !strings.Contains(output, "Temporary redirect followed") {
+		t.Errorf("stdout = %q, want the temporary hop narrated as kept", output)
+	}
+}
+
+// A 404 behind a temporary redirect is still a dead link: the liveness verdict
+// belongs to the final answer even when the URL is not rewritten.
+func TestFollowRedirects_DeadLinkBehindTemporaryRedirect(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/gone" {
+				w.WriteHeader(http.StatusNotFound)
+
+				return
+			}
+			w.Header().Set("Location", "/gone")
 			w.WriteHeader(http.StatusFound)
 		}))
 	t.Cleanup(server.Close)
 
-	if _, err := followRedirects(server.URL, false); err != nil {
-		t.Fatalf("followRedirects() error = %v, want nil at the hop limit", err)
-	}
-	if requests > maxRedirectHops {
-		t.Errorf("issued %d requests, want at most %d", requests, maxRedirectHops)
-	}
-}
-
-//nolint:paralleltest // writes to the stats singleton
-func TestFollowRedirects_ReportsDeadLink(t *testing.T) {
-	resetStats(t)
-
-	server := staticServer(t, http.StatusNotFound, "")
-
-	if _, err := followRedirects(server.URL, false); !errors.Is(err, errDeadLink) {
+	if _, err := newTestChecker(t).followRedirects(server.URL + "/page"); !errors.Is(err,
+		errDeadLink) {
 		t.Errorf("followRedirects() error = %v, want errDeadLink", err)
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint
+func TestFollowRedirects_ReportsDeadLink(t *testing.T) {
+	t.Parallel()
+
+	server := staticServer(t, http.StatusNotFound, "")
+
+	if _, err := newTestChecker(t).followRedirects(server.URL); !errors.Is(err, errDeadLink) {
+		t.Errorf("followRedirects() error = %v, want errDeadLink", err)
+	}
+}
+
 func TestGetBookmarks_Success(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK,
+	chk := newWriteChecker(t, staticServer(t, http.StatusOK,
 		`[{"href":"http://example.com","description":"Test","tags":"tag1",`+
-			`"extended":"notes","time":"2020-01-02T03:04:05Z","shared":"no","toread":"yes"}]`)
-	useEndpoint(t, server.URL)
+			`"extended":"notes","time":"2020-01-02T03:04:05Z","shared":"no","toread":"yes"}]`).URL)
 
-	bookmarks, err := getBookmarks(testToken)
+	bookmarks, err := chk.getBookmarks()
 	if err != nil {
 		t.Fatalf("getBookmarks() error = %v, want nil", err)
 	}
@@ -662,28 +813,27 @@ func TestGetBookmarks_Success(t *testing.T) {
 		t.Errorf("URL = %q, want %q", got.URL, testURL)
 	}
 	// These three exist so updateBookmark can hand them back to posts/add.
-	if got.Time != "2020-01-02T03:04:05Z" {
+	if got.Time != testTime {
 		t.Errorf("Time = %q, want the creation timestamp", got.Time)
 	}
 	if got.Shared != "no" {
 		t.Errorf("Shared = %q, want %q", got.Shared, "no")
 	}
-	if got.ToRead != "yes" {
-		t.Errorf("ToRead = %q, want %q", got.ToRead, "yes")
+	if got.ToRead != valueYes {
+		t.Errorf("ToRead = %q, want %q", got.ToRead, valueYes)
 	}
 }
 
 // A 401 used to reach the JSON decoder and surface as "failed to decode
 // bookmarks JSON", pointing the operator at the wrong problem.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestGetBookmarks_InvalidTokenNamesTheToken(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusUnauthorized, "API requires authentication")
-	useEndpoint(t, server.URL)
+	chk := newWriteChecker(t,
+		staticServer(t, http.StatusUnauthorized, "API requires authentication").URL)
+	chk.apiToken = "invalid-token"
 
-	_, err := getBookmarks("invalid-token")
+	_, err := chk.getBookmarks()
 	if err == nil {
 		t.Fatal("getBookmarks() error = nil, want an error for an invalid token")
 	}
@@ -693,16 +843,8 @@ func TestGetBookmarks_InvalidTokenNamesTheToken(t *testing.T) {
 }
 
 // Pinboard's docs require clients to back off on 429 rather than keep sending.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint and widens the rate limiter
 func TestPinboardGet_BacksOffOn429(t *testing.T) {
-	resetStats(t)
-
-	previousInterval := rateLimitInterval
-	t.Cleanup(func() {
-		rateLimitInterval = previousInterval
-		rateLimiter.Reset(previousInterval)
-	})
+	t.Parallel()
 
 	attempts := 0
 	rec := newRecordingServer(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -715,40 +857,38 @@ func TestPinboardGet_BacksOffOn429(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		writeBody(t, w, `[]`)
 	})
-	useEndpoint(t, rec.URL)
 
-	if _, err := getBookmarks(testToken); err != nil {
+	chk := newWriteChecker(t, rec.URL)
+	before := chk.limiter.interval
+
+	if _, err := chk.getBookmarks(); err != nil {
 		t.Fatalf("getBookmarks() error = %v, want nil after a retried 429", err)
 	}
 	if attempts != 3 {
 		t.Errorf("made %d attempts, want 3", attempts)
 	}
-	if rateLimitInterval <= previousInterval {
-		t.Errorf("interval = %s, want it widened from %s", rateLimitInterval, previousInterval)
+	if after := chk.limiter.interval; after <= before {
+		t.Errorf("interval = %s, want it widened from %s", after, before)
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestUpdateBookmark_PreservesMetadataAndTargetsTheNewURL(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	rec := newRecordingServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		writeBody(t, w, `{"result_code":"done"}`)
-	})
-	useEndpoint(t, rec.URL)
+	rec := okServer(t)
+	chk := newWriteChecker(t, rec.URL)
 
 	bookmark := Bookmark{
 		URL:    testURL,
 		Title:  "Old",
 		Notes:  "notes",
 		Tags:   "x y",
-		Time:   "2020-01-02T03:04:05Z",
+		Time:   testTime,
 		Shared: "no",
-		ToRead: "yes",
+		ToRead: valueYes,
 	}
 
-	if err := updateBookmark(testToken, bookmark, testNewURL, testTitle, ""); err != nil {
+	if err := chk.updateBookmark(bookmark, testNewURL, testTitle, ""); err != nil {
 		t.Fatalf("updateBookmark() error = %v, want nil", err)
 	}
 
@@ -776,15 +916,13 @@ func TestUpdateBookmark_PreservesMetadataAndTargetsTheNewURL(t *testing.T) {
 
 // Pinboard reports a rejected write in the body at HTTP 200, so a status-only
 // check counted failures as successes.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestUpdateBookmark_RejectsInBandFailure(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, `{"result_code":"something went wrong"}`)
-	useEndpoint(t, server.URL)
+	chk := newWriteChecker(t,
+		staticServer(t, http.StatusOK, `{"result_code":"something went wrong"}`).URL)
 
-	err := updateBookmark(testToken, Bookmark{URL: testURL}, testURL, "", "")
+	err := chk.updateBookmark(Bookmark{URL: testURL}, testURL, "", "")
 	if err == nil {
 		t.Fatal("updateBookmark() error = nil, want an error for a rejected write")
 	}
@@ -793,27 +931,27 @@ func TestUpdateBookmark_RejectsInBandFailure(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestUpdateBookmark_Unauthorized(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusUnauthorized, "")
-	useEndpoint(t, server.URL)
+	chk := newWriteChecker(t, staticServer(t, http.StatusUnauthorized, "").URL)
+	chk.apiToken = "invalid"
 
-	if err := updateBookmark("invalid", Bookmark{URL: testURL}, testURL, "", ""); err == nil {
+	if err := chk.updateBookmark(Bookmark{URL: testURL}, testURL, "", ""); err == nil {
 		t.Error("updateBookmark() error = nil, want an error for an invalid token")
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestDeleteBookmark(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		status  int
 		body    string
 		wantErr bool
 	}{
-		{name: "success", status: http.StatusOK, body: `{"result_code":"done"}`},
+		{name: "success", status: http.StatusOK, body: testDoneBody},
 		{
 			// posts/delete answers an unknown URL with 200 and this code.
 			name:    "item not found",
@@ -826,12 +964,11 @@ func TestDeleteBookmark(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
+			t.Parallel()
 
-			server := staticServer(t, testCase.status, testCase.body)
-			useEndpoint(t, server.URL)
+			chk := newWriteChecker(t, staticServer(t, testCase.status, testCase.body).URL)
 
-			err := deleteBookmark(testToken, testURL)
+			err := chk.deleteBookmark(testURL)
 			if (err != nil) != testCase.wantErr {
 				t.Errorf("deleteBookmark() error = %v, wantErr %v", err, testCase.wantErr)
 			}
@@ -839,8 +976,9 @@ func TestDeleteBookmark(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestFetchTitleIfNeeded(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		bookmark   Bookmark
@@ -874,38 +1012,40 @@ func TestFetchTitleIfNeeded(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
-			setSkipFlags(t, testCase.skipTitles, true)
+			t.Parallel()
 
 			server := staticServer(t, http.StatusOK,
 				"<html><head><title>Fetched Title</title></head></html>")
 
+			chk := newTestChecker(t)
+			chk.skipTitles = testCase.skipTitles
+
 			bookmark := testCase.bookmark
 			bookmark.URL = server.URL
 
-			if got := fetchTitleIfNeeded(bookmark, ""); got != testCase.wantTitle {
+			if got := chk.fetchTitleIfNeeded(bookmark, ""); got != testCase.wantTitle {
 				t.Errorf("fetchTitleIfNeeded() = %q, want %q", got, testCase.wantTitle)
 			}
 		})
 	}
 }
 
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestFetchTitleIfNeeded_PrefersTheNewURL(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, false, true)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusOK,
 		"<html><head><title>New URL Title</title></head></html>")
 
-	got := fetchTitleIfNeeded(Bookmark{URL: "http://old.example.com", Title: ""}, server.URL)
+	got := newTestChecker(t).fetchTitleIfNeeded(
+		Bookmark{URL: "http://old.example.com", Title: ""}, server.URL)
 	if got != "New URL Title" {
 		t.Errorf("fetchTitleIfNeeded() = %q, want the title from the new URL", got)
 	}
 }
 
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestFetchTagsIfNeeded(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name         string
 		bookmark     Bookmark
@@ -932,16 +1072,15 @@ func TestFetchTagsIfNeeded(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
-			setSkipFlags(t, true, testCase.skipAutoTags)
+			t.Parallel()
 
-			server := staticServer(t, http.StatusOK, `[{"popular":["tag1"]}]`)
-			useEndpoint(t, server.URL)
+			chk := newWriteChecker(t, staticServer(t, http.StatusOK, `[{"popular":["tag1"]}]`).URL)
+			chk.skipAutoTags = testCase.skipAutoTags
 
 			bookmark := testCase.bookmark
 			bookmark.URL = testURL
 
-			got := fetchTagsIfNeeded(bookmark, testToken, "")
+			got := chk.fetchTagsIfNeeded(bookmark, "")
 			if testCase.wantEmpty && got != "" {
 				t.Errorf("fetchTagsIfNeeded() = %q, want empty", got)
 			}
@@ -952,27 +1091,36 @@ func TestFetchTagsIfNeeded(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // mutates the skip flags and the stats singleton
+// newProcessChecker returns a test checker with both lookups off, for tests of
+// the URL verdict alone.
+func newProcessChecker(t *testing.T) *checker {
+	t.Helper()
+
+	chk := newTestChecker(t)
+	chk.skipTitles = true
+	chk.skipAutoTags = true
+
+	return chk
+}
+
 func TestProcessBookmark_NoChanges(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusOK, "")
 
-	action := processBookmark(Bookmark{URL: server.URL, Title: testTitleAlt, Tags: testTag}, testToken)
+	action := newProcessChecker(t).processBookmark(
+		Bookmark{URL: server.URL, Title: testTitleAlt, Tags: testTag})
 	if action.Action != ActionNoChange {
 		t.Errorf("processBookmark() action = %v, want ActionNoChange", action.Action)
 	}
 }
 
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestProcessBookmark_DeadLinkIsDeleted(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusNotFound, "")
 
-	action := processBookmark(Bookmark{URL: server.URL, Title: testTitleAlt}, testToken)
+	action := newProcessChecker(t).processBookmark(Bookmark{URL: server.URL, Title: testTitleAlt})
 	if action.Action != ActionDelete {
 		t.Errorf("processBookmark() action = %v, want ActionDelete", action.Action)
 	}
@@ -983,11 +1131,10 @@ func TestProcessBookmark_DeadLinkIsDeleted(t *testing.T) {
 
 // A bookmark whose scheme http.Head cannot dial must be left alone. Deleting
 // these destroyed every saved bookmarklet and mailto: bookmark.
-//
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestProcessBookmark_UndialableSchemeIsSkipped(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, true, true)
+	t.Parallel()
+
+	chk := newProcessChecker(t)
 
 	for _, rawURL := range []string{
 		"mailto:someone@example.com",
@@ -995,52 +1142,51 @@ func TestProcessBookmark_UndialableSchemeIsSkipped(t *testing.T) {
 		"file:///etc/hosts",
 		"javascript:void(0)",
 	} {
-		action := processBookmark(Bookmark{URL: rawURL}, testToken)
+		action := chk.processBookmark(Bookmark{URL: rawURL})
 		if action.Action != ActionNoChange {
 			t.Errorf("processBookmark(%q) action = %v, want ActionNoChange", rawURL, action.Action)
 		}
 	}
 
-	if stats.Skipped != 4 {
-		t.Errorf("Skipped = %d, want 4", stats.Skipped)
+	if chk.stats.Skipped != 4 {
+		t.Errorf("Skipped = %d, want 4", chk.stats.Skipped)
 	}
-	if stats.ActionDelete != 0 {
-		t.Errorf("ActionDelete = %d, want 0", stats.ActionDelete)
+	if chk.stats.ActionDelete != 0 {
+		t.Errorf("ActionDelete = %d, want 0", chk.stats.ActionDelete)
 	}
 }
 
 // A dead bookmark must not pay for a title or tag fetch whose result is thrown
 // away, and the tag fetch costs a rate-limiter slot.
-//
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestProcessBookmark_SkipsFetchesForDeadLinks(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, false, false)
+	t.Parallel()
 
 	rec := newRecordingServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
-	useEndpoint(t, rec.URL)
 
-	action := processBookmark(Bookmark{URL: rec.URL, Title: "", Tags: ""}, testToken)
+	chk := newWriteChecker(t, rec.URL)
+
+	action := chk.processBookmark(Bookmark{URL: rec.URL, Title: "", Tags: ""})
 	if action.Action != ActionDelete {
 		t.Fatalf("processBookmark() action = %v, want ActionDelete", action.Action)
 	}
-	if stats.TitlesFailed != 0 || stats.TagsFailed != 0 {
+	if chk.stats.TitlesFailed != 0 || chk.stats.TagsFailed != 0 {
 		t.Errorf("recorded %d title and %d tag fetches for a dead link, want 0",
-			stats.TitlesFailed, stats.TagsFailed)
+			chk.stats.TitlesFailed, chk.stats.TagsFailed)
 	}
 }
 
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestProcessBookmark_WithTitle(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, false, true)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusOK,
 		"<html><head><title>Test Title</title></head></html>")
 
-	action := processBookmark(Bookmark{URL: server.URL, Title: "", Tags: "existing"}, testToken)
+	chk := newTestChecker(t)
+	chk.skipAutoTags = true
+
+	action := chk.processBookmark(Bookmark{URL: server.URL, Title: "", Tags: "existing"})
 	if action.Action != ActionUpdate {
 		t.Fatalf("processBookmark() action = %v, want ActionUpdate", action.Action)
 	}
@@ -1050,9 +1196,9 @@ func TestProcessBookmark_WithTitle(t *testing.T) {
 }
 
 // processBookmarksParallel had no test at all, which is why -workers 0 shipped.
-//
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestProcessBookmarksParallel(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name      string
 		bookmarks int
@@ -1065,10 +1211,7 @@ func TestProcessBookmarksParallel(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
-			setSkipFlags(t, true, true)
-
-			setCIMode(t, true)
+			t.Parallel()
 
 			server := staticServer(t, http.StatusOK, "")
 
@@ -1077,8 +1220,11 @@ func TestProcessBookmarksParallel(t *testing.T) {
 				bookmarks[i] = Bookmark{URL: server.URL, Title: "t", Tags: "x"}
 			}
 
-			actions := processBookmarksParallel(bookmarks, testToken, testCase.workers)
-			if len(actions) != testCase.bookmarks {
+			chk := newProcessChecker(t)
+			chk.ciMode = true
+			chk.workers = testCase.workers
+
+			if actions := chk.processBookmarksParallel(bookmarks); len(actions) != testCase.bookmarks {
 				t.Errorf("got %d actions, want %d", len(actions), testCase.bookmarks)
 			}
 		})
@@ -1087,11 +1233,10 @@ func TestProcessBookmarksParallel(t *testing.T) {
 
 // TestVersionString covers the ldflags path: an empty `version` must fall back
 // to build info rather than reporting an empty version, and a stamped one wins.
-func TestVersionString(t *testing.T) { //nolint:paralleltest // mutates the package-level version
-	original := version
-	t.Cleanup(func() { version = original })
-
-	version = "1.2.3"
+//
+//nolint:paralleltest // mutates the package-level version
+func TestVersionString(t *testing.T) {
+	swap(t, &version, "1.2.3")
 
 	if got := versionString(); got != "1.2.3" {
 		t.Errorf("versionString() = %q, want the stamped version", got)

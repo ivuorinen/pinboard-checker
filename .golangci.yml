@@ -1,5 +1,4 @@
-# golangci-lint configuration
-# Version: 2.12.2 (golangci-lint v2)
+# golangci-lint configuration; the golangci-lint version is pinned in mise.toml.
 
 version: "2"
 
@@ -126,26 +125,8 @@ linters:
       min-len: 3
       min-occurrences: 3
 
-    gosec:
-      excludes:
-        - G204 # Subprocess launching with variable
-        - G304 # File path provided as taint input
-      includes:
-        - G101 # Look for hard coded credentials
-        - G102 # Bind to all interfaces
-        - G103 # Audit the use of unsafe block
-        - G104 # Audit errors not checked
-        - G201 # SQL query construction using format string
-        - G202 # SQL query construction using string concatenation
-        - G401 # Detect the usage of MD5 or SHA1
-        - G402 # Look for bad TLS connection settings
-        - G403 # Ensure minimum RSA key length of 2048 bits
-        - G404 # Insecure random number source (rand)
-
     misspell:
       locale: US
-      ignore-rules:
-        - tmux
 
     gocognit:
       min-complexity: 15
@@ -166,13 +147,10 @@ linters:
       ignore-chan-recv-ok: true
       ignore-names:
         - wg
-        - tm
-        - ui
         - mu
         - b
         - err
         - ok
-        - id
         - i
         - j
         - k
@@ -189,8 +167,6 @@ linters:
           allow:
             - $gostd
             - github.com/ivuorinen/pinboard-checker
-            - github.com/joho/godotenv
-            - github.com/schollz/progressbar
             - golang.org/x/net
           deny:
             - pkg: "io/ioutil"
@@ -202,7 +178,7 @@ linters:
           disabled: false
           arguments:
             - ["ID"] # AllowList
-            - ["VM"] # DenyList
+            - [] # DenyList
             - - skip-initialism-name-checks: true
                 upper-case-const: true
                 skip-package-name-checks: true
@@ -217,15 +193,6 @@ linters:
         - .Errorf(
         - errors.New(
         - errors.Unwrap(
-        - .Wrap(
-        - .Wrapf(
-        - .WithMessage(
-        - .WithMessagef(
-        - .WithStack(
-        - errutil.New(
-        - errutil.Newf(
-        - errutil.LogAndWrap(
-        - errutil.LogAndWrapf(
 
     lll:
       line-length: 100

@@ -44,7 +44,10 @@ threshold=${2:-100}
 markers=$(mktemp)
 trap 'rm -f "$markers"' EXIT
 
-grep -rln 'coverage:ignore' --include='*.go' . 2>/dev/null |
+# grep exits 1 when no file carries a marker. That is a normal state, and under
+# pipefail it would end the script silently, so only status 2 -- a real error,
+# reported on stderr -- may fail the pipeline.
+{ grep -rln 'coverage:ignore' --include='*.go' . || [ $? -eq 1 ]; } |
   while IFS= read -r file; do
     awk -v file="${file#./}" '
       /coverage:ignore/ { pending = 1; print file ":" NR; next }

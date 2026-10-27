@@ -1,7 +1,8 @@
 // safety_test.go covers the branches that stand between a bookmark and a
 // deletion. Every one of them is the guard for a defect that previously
-// destroyed data: an unreachable host, a shortener returning something that is
-// not a web address, or a redirect pointing at a scheme net/http cannot dial.
+// destroyed data: an unreachable host, a redirect pointing at a scheme
+// net/http cannot dial, or a status that describes access rather than
+// existence.
 package main
 
 import (
@@ -10,7 +11,9 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -28,15 +31,26 @@ func unreachableURL(t *testing.T) string {
 	return endpoint
 }
 
+// closeResponse closes a response body inside a test and fails the test if the
+// close fails.
+func closeResponse(t *testing.T, resp *http.Response) {
+	t.Helper()
+
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("failed to close response body: %v", err)
+	}
+}
+
 // A host that cannot be reached is not a host that said "gone". Deleting on a
 // transport failure would destroy every bookmark behind a DNS outage.
-//
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestProcessBookmark_TransportFailureIsSkipped(t *testing.T) {
-	resetStats(t)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
-	action := processBookmark(Bookmark{URL: unreachableURL(t), Title: "t"}, testToken)
+	chk := newTestChecker(t)
+	chk.skipTitles = true
+	chk.skipAutoTags = true
+
+	action := chk.processBookmark(Bookmark{URL: unreachableURL(t), Title: "t"})
 
 	if action.Action != ActionNoChange {
 		t.Errorf("processBookmark() action = %v, want ActionNoChange", action.Action)
@@ -44,40 +58,18 @@ func TestProcessBookmark_TransportFailureIsSkipped(t *testing.T) {
 	if !errors.Is(action.Error, errUnverifiable) {
 		t.Errorf("action.Error = %v, want errUnverifiable", action.Error)
 	}
-	if stats.Skipped != 1 {
-		t.Errorf("Skipped = %d, want 1", stats.Skipped)
+	if chk.stats.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", chk.stats.Skipped)
 	}
-	if stats.ActionDelete != 0 {
-		t.Errorf("ActionDelete = %d, want 0 for an unreachable host", stats.ActionDelete)
-	}
-}
-
-// A shortener that resolves to a non-web scheme must not have that value
-// written back as the bookmark's URL.
-//
-//nolint:paralleltest // mutates the shortener seam and the stats singleton
-func TestExpandAndCheckURL_RejectsNonHTTPExpansion(t *testing.T) {
-	resetStats(t)
-
-	swap(t, &unshortenIsGd, func(_ string) (string, error) {
-		return testFTPURL, nil
-	})
-
-	_, err := expandAndCheckURL("https://is.gd/abc", false)
-	if !errors.Is(err, errUnverifiable) {
-		t.Errorf("expandAndCheckURL() error = %v, want errUnverifiable", err)
-	}
-	if errors.Is(err, errDeadLink) {
-		t.Error("an unexpandable scheme must not be reported as a dead link")
+	if chk.stats.ActionDelete != 0 {
+		t.Errorf("ActionDelete = %d, want 0 for an unreachable host", chk.stats.ActionDelete)
 	}
 }
 
-// Likewise for a redirect: a Location pointing at mailto: or ftp: is not a
-// destination this tool can verify, and must not become the bookmark.
-//
-//nolint:paralleltest // writes to the stats singleton
+// A redirect whose Location points at mailto: or ftp: is not a destination
+// this tool can verify, and must not become the bookmark.
 func TestFollowRedirects_RejectsNonHTTPRedirect(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -86,21 +78,78 @@ func TestFollowRedirects_RejectsNonHTTPRedirect(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	_, err := followRedirects(server.URL, false)
-	if !errors.Is(err, errUnverifiable) {
+	if _, err := newTestChecker(t).followRedirects(server.URL); !errors.Is(err, errUnverifiable) {
 		t.Errorf("followRedirects() error = %v, want errUnverifiable", err)
 	}
 }
 
-// When a host refuses HEAD and the GET retry also fails, the HEAD status stands
-// rather than the failure being swallowed into a success.
-//
-//nolint:paralleltest // writes to the stats singleton
+// When a host refuses HEAD and the GET retry also fails, the HEAD status and
+// host stand rather than the failure being swallowed into a success.
 func TestConfirmWithGet_KeepsHeadStatusWhenGetFails(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	if got := confirmWithGet(unreachableURL(t), http.StatusForbidden); got != http.StatusForbidden {
-		t.Errorf("confirmWithGet() = %d, want the original HEAD status", got)
+	const headHost = "head.example"
+
+	got, host := newTestChecker(t).confirmWithGet(unreachableURL(t), http.StatusForbidden, headHost)
+	if got != http.StatusForbidden || host != headHost {
+		t.Errorf("confirmWithGet() = %d, %q; want the original HEAD status and host", got, host)
+	}
+}
+
+// The GET re-check follows redirects, so the private-address guard runs on each
+// hop: a host that refuses HEAD could otherwise steer the GET at the user's own
+// network. The refused redirect is a failed GET, so the HEAD status stands.
+func TestConfirmWithGet_RefusesRedirectToNonPublicHost(t *testing.T) {
+	t.Parallel()
+
+	privateRequests := 0
+	private := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			privateRequests++
+			w.WriteHeader(http.StatusNotFound)
+		}))
+	t.Cleanup(private.Close)
+
+	public := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, private.URL+"/", http.StatusFound)
+		}))
+	t.Cleanup(public.Close)
+
+	chk := newTestChecker(t)
+	chk.isPublicHost = func(rawURL string) bool { return !strings.HasPrefix(rawURL, private.URL) }
+
+	got, _ := chk.confirmWithGet(public.URL+"/page", http.StatusForbidden, "")
+	if got != http.StatusForbidden {
+		t.Errorf("confirmWithGet() = %d, want the HEAD status %d", got, http.StatusForbidden)
+	}
+	if privateRequests != 0 {
+		t.Errorf("the non-public host got %d requests, want none", privateRequests)
+	}
+}
+
+// A redirect chain longer than maxRedirectHops stops at the limit, the same
+// request budget followRedirects spends, and the last redirect answer is the
+// status reported.
+func TestConfirmWithGet_StopsAtHopLimit(t *testing.T) {
+	t.Parallel()
+
+	var server *httptest.Server
+
+	requests := 0
+	server = httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			http.Redirect(w, r, server.URL+"/next", http.StatusFound)
+		}))
+	t.Cleanup(server.Close)
+
+	got, _ := newTestChecker(t).confirmWithGet(server.URL, http.StatusForbidden, "")
+	if got != http.StatusFound {
+		t.Errorf("confirmWithGet() = %d, want the last redirect's %d", got, http.StatusFound)
+	}
+	if requests != maxRedirectHops {
+		t.Errorf("issued %d requests, want %d", requests, maxRedirectHops)
 	}
 }
 
@@ -108,14 +157,12 @@ func TestConfirmWithGet_KeepsHeadStatusWhenGetFails(t *testing.T) {
 // for bot protection, but it sends Go's default User-Agent and no JS, so it is
 // answered 403 by exactly the protection it was written to see past — which
 // made a confirmed 403 a deletion of a live page.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_ConfirmedForbiddenIsUnverifiable(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := staticServer(t, http.StatusForbidden, "")
 
-	_, err := checkURL(server.URL, "test context")
+	_, _, err := newTestChecker(t).checkURL(server.URL, "test context")
 	if !errors.Is(err, errUnverifiable) {
 		t.Errorf("checkURL() error = %v, want errUnverifiable when GET also refuses", err)
 	}
@@ -124,11 +171,84 @@ func TestCheckURL_ConfirmedForbiddenIsUnverifiable(t *testing.T) {
 	}
 }
 
+// GitHub answers an unauthenticated request for a private repository with 404,
+// so on that host a 404 is no evidence the page is gone. The httptest host is
+// registered in its place; the bookmark must be skipped and counted, not
+// deleted.
+func TestCheckURL_NotFoundFromMaskingHostIsUnverifiable(t *testing.T) {
+	t.Parallel()
+
+	server := staticServer(t, http.StatusNotFound, "")
+
+	chk := newTestChecker(t)
+	chk.notFoundMasksPrivate = map[string]bool{"127.0.0.1": true}
+
+	action := chk.processBookmark(Bookmark{URL: server.URL + "/org/private-repo"})
+
+	if action.Action == ActionDelete {
+		t.Fatal("a 404 from a host that masks private resources deleted the bookmark")
+	}
+	if !errors.Is(action.Error, errUnverifiable) {
+		t.Errorf("error = %v, want errUnverifiable", action.Error)
+	}
+	if chk.stats.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", chk.stats.Skipped)
+	}
+}
+
+// A short link refuses HEAD, and the GET re-check follows its redirect to a
+// host that answers 404 for private resources. The 404 belongs to that host,
+// so the exception must test it, not the host that refused HEAD: a short link
+// to a private GitHub repository was deleted. The masking host is the same
+// server reached as localhost, so the two hosts differ by name.
+func TestCheckURL_NotFoundBehindGETRedirectToMaskingHost(t *testing.T) {
+	t.Parallel()
+
+	masking, err := url.Parse(staticServer(t, http.StatusNotFound, "").URL)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	masking.Host = "localhost:" + masking.Port()
+	masking.Path = "/org/private-repo"
+
+	short := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+
+				return
+			}
+			http.Redirect(w, r, masking.String(), http.StatusFound)
+		}))
+	t.Cleanup(short.Close)
+
+	chk := newTestChecker(t)
+	chk.notFoundMasksPrivate = map[string]bool{"localhost": true}
+
+	_, _, err = chk.checkURL(short.URL, "test context")
+	if !errors.Is(err, errUnverifiable) || errors.Is(err, errDeadLink) {
+		t.Errorf("checkURL() error = %v, want errUnverifiable for the masking host's 404", err)
+	}
+}
+
+// The production set names github.com; a 404 from any other host still deletes.
+func TestNotFoundMasksPrivate_NamesGitHub(t *testing.T) {
+	t.Parallel()
+
+	masks := newTestChecker(t).notFoundMasksPrivate
+	if !masks["github.com"] {
+		t.Error("github.com must be listed: it answers 404 for private repositories")
+	}
+	if masks["gist.github.com"] {
+		t.Error("gist.github.com must not be listed: a secret gist opens by URL")
+	}
+}
+
 // The status set that may delete a bookmark, pinned. Only an answer about the
 // resource counts; every other 4xx describes the request and must be skipped.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestCheckURL_OnlyGoneStatusesDelete(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		status int
 		dead   bool
@@ -146,11 +266,11 @@ func TestCheckURL_OnlyGoneStatusesDelete(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(http.StatusText(testCase.status), func(t *testing.T) {
-			resetStats(t)
+			t.Parallel()
 
 			server := staticServer(t, testCase.status, "")
 
-			_, err := checkURL(server.URL, "test context")
+			_, _, err := newTestChecker(t).checkURL(server.URL, "test context")
 			if got := errors.Is(err, errDeadLink); got != testCase.dead {
 				t.Errorf("status %d: errDeadLink = %v, want %v (err = %v)",
 					testCase.status, got, testCase.dead, err)
@@ -165,32 +285,24 @@ func TestCheckURL_OnlyGoneStatusesDelete(t *testing.T) {
 
 // If the trimmed variant cannot be reached at all, the original URL stands;
 // reporting an error here would route the bookmark to deletion.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestFixParenthesesSuffix_UnreachableTrimmedURLKeepsOriginal(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	original := unreachableURL(t) + "/page)"
+	chk := newTestChecker(t)
 
-	got, err := fixParenthesesSuffix(original, false)
-	if err != nil {
-		t.Fatalf("fixParenthesesSuffix() error = %v, want nil", err)
-	}
-	if got != original {
+	if got := chk.fixParenthesesSuffix(original); got != original {
 		t.Errorf("fixParenthesesSuffix() = %q, want the original %q", got, original)
 	}
-	if stats.ParenthesesFixed != 0 {
-		t.Errorf("ParenthesesFixed = %d, want 0", stats.ParenthesesFixed)
+	if chk.stats.ParenthesesFixed != 0 {
+		t.Errorf("ParenthesesFixed = %d, want 0", chk.stats.ParenthesesFixed)
 	}
 }
 
 // A failed delete of the stale URL leaves a duplicate behind, so it must be
 // counted even though the add succeeded.
-//
-//nolint:paralleltest // mutates the stats singleton and the verbose flag
 func TestApplyUpdateWrite_FailedOldURLDeleteIsCounted(t *testing.T) {
-	resetStats(t)
-	setVerbose(t, false)
+	t.Parallel()
 
 	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -201,23 +313,24 @@ func TestApplyUpdateWrite_FailedOldURLDeleteIsCounted(t *testing.T) {
 			return
 		}
 
-		writeBody(t, w, `{"result_code":"done"}`)
+		writeBody(t, w, testDoneBody)
 	})
-	useEndpoint(t, server.URL)
 
-	applyUpdateWrite(BookmarkAction{
+	chk := newWriteChecker(t, server.URL)
+
+	chk.applyUpdateWrite(BookmarkAction{
 		Original: Bookmark{URL: testURL},
 		Action:   ActionUpdate,
 		NewURL:   testNewURL,
-	}, testToken)
+	})
 
 	// The add landed, so the update counts; the delete did not, so the failure
 	// counts too. Reporting only one of the two would misstate the outcome.
-	if stats.UpdatesPerformed != 1 {
-		t.Errorf("UpdatesPerformed = %d, want 1", stats.UpdatesPerformed)
+	if chk.stats.UpdatesPerformed != 1 {
+		t.Errorf("UpdatesPerformed = %d, want 1", chk.stats.UpdatesPerformed)
 	}
-	if stats.ApplyErrors != 1 {
-		t.Errorf("ApplyErrors = %d, want 1 for the failed delete", stats.ApplyErrors)
+	if chk.stats.ApplyErrors != 1 {
+		t.Errorf("ApplyErrors = %d, want 1 for the failed delete", chk.stats.ApplyErrors)
 	}
 }
 
@@ -262,11 +375,8 @@ func TestIsPublicHostImpl(t *testing.T) {
 
 // A redirect into private space must be skipped, never deleted: the tool could
 // not check the real destination, so it has no verdict to act on.
-//
-//nolint:paralleltest // mutates the package-level guard and the stats singleton
 func TestFollowRedirects_RejectsPrivateRedirectTarget(t *testing.T) {
-	resetStats(t)
-	swap(t, &isPublicHost, isPublicHostImpl)
+	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -275,75 +385,15 @@ func TestFollowRedirects_RejectsPrivateRedirectTarget(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	_, err := followRedirects(server.URL, false)
+	chk := newTestChecker(t)
+	chk.isPublicHost = isPublicHostImpl
+
+	_, err := chk.followRedirects(server.URL)
 	if !errors.Is(err, errUnverifiable) {
 		t.Errorf("followRedirects() error = %v, want errUnverifiable", err)
 	}
 	if errors.Is(err, errDeadLink) {
 		t.Error("a redirect into private space must not be reported as a dead link")
-	}
-}
-
-// A shortener answering with a private address must be refused as firmly as a
-// redirect to one: the expansion is written straight back as the bookmark URL.
-//
-//nolint:paralleltest // mutates the package-level guard
-func TestValidExpandedURL_RejectsNonPublicHost(t *testing.T) {
-	swap(t, &isPublicHost, isPublicHostImpl)
-
-	if _, err := validExpandedURL("http://127.0.0.1:8080/admin"); err == nil {
-		t.Error("validExpandedURL() error = nil, want a rejection for a loopback host")
-	}
-
-	// The guard must not reject an ordinary public destination.
-	if _, err := validExpandedURL("http://8.8.8.8/page"); err != nil {
-		t.Errorf("validExpandedURL() error = %v, want nil for a public host", err)
-	}
-}
-
-// A repair step that fails must abort the pipeline rather than carrying a
-// half-repaired URL into the liveness check.
-//
-//nolint:paralleltest // mutates the repair pipeline and the stats singleton
-func TestExpandAndCheckURL_StepFailureIsReturned(t *testing.T) {
-	resetStats(t)
-
-	boom := errors.New("step exploded")
-
-	// A step that fails: neither real step does today, so without this the
-	// pipeline's error path would never run.
-	swap(t, &repairSteps, []urlStep{
-		{name: "failing step", fn: func(string, bool) (string, error) { return "", boom }},
-	})
-
-	_, err := expandAndCheckURL(testURL, false)
-	if !errors.Is(err, boom) {
-		t.Errorf("expandAndCheckURL() error = %v, want the step's error", err)
-	}
-}
-
-// The dispatch table's tinyurl entry must actually route to the tinyurl
-// expander; a table whose closures are never exercised is a table that can be
-// mis-wired without any test failing.
-//
-//nolint:paralleltest // mutates the shortener seam and the stats singleton
-func TestExpandURL_DispatchesTinyURL(t *testing.T) {
-	resetStats(t)
-
-	swap(t, &unshortenTinyURL, func(_ string) (string, error) {
-		return testFinalURL, nil
-	})
-
-	got, err := expandURL("https://tinyurl.com/abc", false)
-	if err != nil {
-		t.Fatalf("expandURL() error = %v, want nil", err)
-	}
-	if got != testFinalURL {
-		t.Errorf("expandURL() = %q, want %q", got, testFinalURL)
-	}
-	if stats.ShortURLsExpanded[svcTinyURL] != 1 {
-		t.Errorf("expected one recorded tinyurl expansion, got %d",
-			stats.ShortURLsExpanded[svcTinyURL])
 	}
 }
 
@@ -370,15 +420,54 @@ func TestUserAgentTransport_KeepsCallerUserAgent(t *testing.T) {
 	}
 	request.Header.Set("User-Agent", "caller-chosen/1.0")
 
-	//nolint:bodyclose // closeBody below closes it; bodyclose cannot see through the helper
 	resp, err := client.Do(request)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	defer closeBody(resp.Body)
+	defer closeResponse(t, resp)
 
 	if seen != "caller-chosen/1.0" {
 		t.Errorf("User-Agent = %q, want the caller's own", seen)
+	}
+}
+
+// The worker pool sends the redirect client's first requests from many
+// goroutines at once. The User-Agent used to be a field written lazily inside
+// RoundTrip, and that write raced; under -race this test fails if it comes back.
+func TestUserAgentTransport_ConcurrentFirstUse(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+
+	agents := map[string]int{}
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			agents[r.UserAgent()]++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		}))
+	t.Cleanup(server.Close)
+
+	client := &http.Client{Transport: newUserAgentTransport()}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			resp, err := client.Get(server.URL)
+			if err != nil {
+				t.Errorf("request failed: %v", err)
+
+				return
+			}
+			closeResponse(t, resp)
+		})
+	}
+	wg.Wait()
+
+	if len(agents) != 1 || agents[userAgent()] != 8 {
+		t.Errorf("User-Agents seen = %v, want 8 requests all carrying %q", agents, userAgent())
 	}
 }
 
@@ -397,12 +486,11 @@ func TestUserAgentTransport_SetsDefaultUserAgent(t *testing.T) {
 
 	client := &http.Client{Transport: newUserAgentTransport()}
 
-	//nolint:bodyclose // closeBody below closes it; bodyclose cannot see through the helper
 	resp, err := client.Get(server.URL)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	defer closeBody(resp.Body)
+	defer closeResponse(t, resp)
 
 	if !strings.HasPrefix(seen, "pinboard-checker/") {
 		t.Errorf("User-Agent = %q, want it to name the tool", seen)
@@ -415,22 +503,17 @@ func TestUserAgentTransport_SetsDefaultUserAgent(t *testing.T) {
 // Requests to one host must be spaced, or a worker pool checking many
 // bookmarks on one domain bursts it and is answered 429 — which this tool then
 // has to interpret, having caused it itself.
-//
-//nolint:paralleltest // mutates the package-level host throttle
-func TestWaitForHost_SpacesRequestsToOneHost(t *testing.T) {
+func TestHostThrottle_SpacesRequestsToOneHost(t *testing.T) {
+	t.Parallel()
+
 	const interval = 20 * time.Millisecond
 
-	swap(t, &perHostInterval, interval)
-
-	previousSlots := hostNextSlot
-	t.Cleanup(func() { hostNextSlot = previousSlots })
-	hostNextSlot = map[string]time.Time{}
-
+	hosts := newHostThrottle(interval)
 	server := staticServer(t, http.StatusOK, "")
 
 	start := time.Now()
 	for range 3 {
-		waitForHost(server.URL)
+		hosts.wait(server.URL)
 	}
 	elapsed := time.Since(start)
 
@@ -444,38 +527,19 @@ func TestWaitForHost_SpacesRequestsToOneHost(t *testing.T) {
 
 // Different hosts must not throttle each other, or the pool serializes on a
 // budget that was never meant to be global.
-//
-//nolint:paralleltest // mutates the package-level host throttle
-func TestWaitForHost_DoesNotSpaceDistinctHosts(t *testing.T) {
-	swap(t, &perHostInterval, time.Hour)
+func TestHostThrottle_DoesNotSpaceDistinctHosts(t *testing.T) {
+	t.Parallel()
 
-	previousSlots := hostNextSlot
-	t.Cleanup(func() { hostNextSlot = previousSlots })
-	hostNextSlot = map[string]time.Time{}
-
+	hosts := newHostThrottle(time.Hour)
 	first := staticServer(t, http.StatusOK, "")
 	second := staticServer(t, http.StatusOK, "")
 
 	start := time.Now()
-	waitForHost(first.URL)
-	waitForHost(second.URL)
+	hosts.wait(first.URL)
+	hosts.wait(second.URL)
 
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("two distinct hosts took %s; they must not share a slot", elapsed)
-	}
-}
-
-// setKnownURLs points the run's existing-URL set at a fixed list and restores
-// it afterwards, the same save-restore shape the other package-level seams use.
-func setKnownURLs(t *testing.T, urls ...string) {
-	t.Helper()
-
-	previous := knownURLs
-	t.Cleanup(func() { knownURLs = previous })
-
-	knownURLs = make(map[string]bool, len(urls))
-	for _, u := range urls {
-		knownURLs[u] = true
 	}
 }
 
@@ -483,32 +547,23 @@ func setKnownURLs(t *testing.T, urls ...string) {
 // written: posts/add with replace=yes overwrites the destination entirely, so
 // the existing bookmark's notes and tags would be replaced by the mover's.
 // Only the duplicate is removed.
-//
-//nolint:paralleltest // mutates the stats singleton, the verbose flag, and knownURLs
 func TestApplyUpdateWrite_ExistingTargetIsMergedNotOverwritten(t *testing.T) {
-	resetStats(t)
-	setKnownURLs(t, testURL, testNewURL)
+	t.Parallel()
 
-	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		writeBody(t, w, `{"result_code":"done"}`)
-		_ = r
-	})
-	useEndpoint(t, server.URL)
-
+	server := okServer(t)
+	chk := newWriteChecker(t, server.URL)
+	chk.knownURLs = map[string]bool{testURL: true, testNewURL: true}
 	// Verbose so the merge's own report line runs; a silent merge would leave
 	// the user unable to tell a collapsed duplicate from a plain update.
-	setVerbose(t, true)
+	chk.verbose = true
 
-	printed := captureOutput(func() {
-		applyUpdateWrite(BookmarkAction{
-			Original: Bookmark{URL: testURL, Title: "mover", Tags: "mover-tag"},
-			Action:   ActionUpdate,
-			NewURL:   testNewURL,
-		}, testToken)
+	chk.applyUpdateAction(BookmarkAction{
+		Original: Bookmark{URL: testURL, Title: "mover", Tags: "mover-tag"},
+		Action:   ActionUpdate,
+		NewURL:   testNewURL,
 	})
 
-	if !strings.Contains(printed, "Merged:") {
+	if printed := stdoutOf(chk); !strings.Contains(printed, "Merged:") {
 		t.Errorf("verbose output = %q, want it to report the merge", printed)
 	}
 
@@ -518,108 +573,194 @@ func TestApplyUpdateWrite_ExistingTargetIsMergedNotOverwritten(t *testing.T) {
 		}
 	}
 
-	if stats.Merged != 1 {
-		t.Errorf("Merged = %d, want 1", stats.Merged)
+	if chk.stats.Merged != 1 {
+		t.Errorf("Merged = %d, want 1", chk.stats.Merged)
 	}
-	if stats.UpdatesPerformed != 0 {
-		t.Errorf("UpdatesPerformed = %d, want 0; nothing was written", stats.UpdatesPerformed)
+	if chk.stats.UpdatesPerformed != 0 {
+		t.Errorf("UpdatesPerformed = %d, want 0; nothing was written", chk.stats.UpdatesPerformed)
 	}
-	if stats.ApplyErrors != 0 {
-		t.Errorf("ApplyErrors = %d, want 0", stats.ApplyErrors)
+	if chk.stats.ApplyErrors != 0 {
+		t.Errorf("ApplyErrors = %d, want 0", chk.stats.ApplyErrors)
 	}
 }
 
 // A merge whose delete Pinboard refuses leaves the duplicate in place, so it
 // must be counted as an apply error — that count is what makes the run exit
 // non-zero, and a silently failed merge would report a clean run.
-//
-//nolint:paralleltest // mutates the stats singleton, the verbose flag, and knownURLs
 func TestApplyUpdateWrite_FailedMergeDeleteIsCounted(t *testing.T) {
-	resetStats(t)
-	setVerbose(t, false)
-	setKnownURLs(t, testURL, testNewURL)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, `{"result_code":"item not found"}`)
-	useEndpoint(t, server.URL)
+	chk := newWriteChecker(t,
+		staticServer(t, http.StatusOK, `{"result_code":"item not found"}`).URL)
+	chk.knownURLs = map[string]bool{testURL: true, testNewURL: true}
 
-	applyUpdateWrite(BookmarkAction{
+	if outcome := chk.applyUpdateWrite(BookmarkAction{
 		Original: Bookmark{URL: testURL},
 		Action:   ActionUpdate,
 		NewURL:   testNewURL,
-	}, testToken)
-
-	if stats.ApplyErrors != 1 {
-		t.Errorf("ApplyErrors = %d, want 1 for the failed merge delete", stats.ApplyErrors)
+	}); outcome != outcomeFailed {
+		t.Errorf("applyUpdateWrite() = %v, want outcomeFailed", outcome)
 	}
-	if stats.Merged != 0 {
-		t.Errorf("Merged = %d, want 0; the duplicate is still there", stats.Merged)
+
+	if chk.stats.ApplyErrors != 1 {
+		t.Errorf("ApplyErrors = %d, want 1 for the failed merge delete", chk.stats.ApplyErrors)
+	}
+	if chk.stats.Merged != 0 {
+		t.Errorf("Merged = %d, want 0; the duplicate is still there", chk.stats.Merged)
 	}
 }
 
 // A destination the account does not hold is still written normally; the merge
 // path must not swallow ordinary URL rewrites.
-//
-//nolint:paralleltest // mutates the stats singleton, the verbose flag, and knownURLs
 func TestApplyUpdateWrite_NewTargetIsWritten(t *testing.T) {
-	resetStats(t)
-	setVerbose(t, false)
-	setKnownURLs(t, testURL)
+	t.Parallel()
 
-	server := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		writeBody(t, w, `{"result_code":"done"}`)
-		_ = r
-	})
-	useEndpoint(t, server.URL)
+	chk := newWriteChecker(t, okServer(t).URL)
+	chk.knownURLs = map[string]bool{testURL: true}
 
-	applyUpdateWrite(BookmarkAction{
+	chk.applyUpdateWrite(BookmarkAction{
 		Original: Bookmark{URL: testURL},
 		Action:   ActionUpdate,
 		NewURL:   testNewURL,
-	}, testToken)
+	})
 
-	if stats.UpdatesPerformed != 1 {
-		t.Errorf("UpdatesPerformed = %d, want 1", stats.UpdatesPerformed)
+	if chk.stats.UpdatesPerformed != 1 {
+		t.Errorf("UpdatesPerformed = %d, want 1", chk.stats.UpdatesPerformed)
 	}
-	if stats.Merged != 0 {
-		t.Errorf("Merged = %d, want 0", stats.Merged)
+	if chk.stats.Merged != 0 {
+		t.Errorf("Merged = %d, want 0", chk.stats.Merged)
+	}
+	// The written URL now counts as held, so a later mover to it merges.
+	if !chk.knownURLs[testNewURL] {
+		t.Error("knownURLs lacks the URL just written")
+	}
+}
+
+// A deleted URL leaves knownURLs. A failed delete leaves the bookmark, so its
+// URL stays.
+func TestDeleteBookmark_ForgetsTheURLOnlyOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	chk := newWriteChecker(t, okServer(t).URL)
+	chk.knownURLs = map[string]bool{testURL: true}
+
+	if err := chk.deleteBookmark(testURL); err != nil {
+		t.Fatalf("deleteBookmark() error = %v, want nil", err)
+	}
+	if chk.knownURLs[testURL] {
+		t.Error("knownURLs still holds the deleted URL")
+	}
+
+	failing := newWriteChecker(t,
+		staticServer(t, http.StatusOK, `{"result_code":"item not found"}`).URL)
+	failing.knownURLs = map[string]bool{testURL: true}
+
+	if err := failing.deleteBookmark(testURL); err == nil {
+		t.Fatal("deleteBookmark() error = nil, want the rejected delete")
+	}
+	if !failing.knownURLs[testURL] {
+		t.Error("a rejected delete dropped the URL from knownURLs")
+	}
+}
+
+// One bookmark merges away from A, then another moves onto A. A no longer
+// exists, so the second must be written there; merged instead, it was deleted
+// as a duplicate of an entry that was already gone.
+func TestApplyBookmarkActions_MoveOntoDeletedURLIsWritten(t *testing.T) {
+	t.Parallel()
+
+	const moved = "http://example.net/moved"
+
+	rec := okServer(t)
+	chk := newWriteChecker(t, rec.URL)
+	chk.knownURLs = map[string]bool{testURL: true, testNewURL: true, moved: true}
+
+	chk.applyBookmarkActions([]BookmarkAction{
+		{Original: Bookmark{URL: testURL}, Action: ActionUpdate, NewURL: testNewURL},
+		{Original: Bookmark{URL: moved}, Action: ActionUpdate, NewURL: testURL},
+	})
+
+	if chk.stats.Merged != 1 || chk.stats.UpdatesPerformed != 1 {
+		t.Errorf("Merged = %d, UpdatesPerformed = %d; want 1 merge, then 1 write",
+			chk.stats.Merged, chk.stats.UpdatesPerformed)
+	}
+
+	wroteAtA := false
+	for _, request := range rec.Requests() {
+		if strings.HasPrefix(request, "/posts/add?") &&
+			strings.Contains(request, url.Values{paramURL: {testURL}}.Encode()) {
+			wroteAtA = true
+		}
+	}
+	if !wroteAtA {
+		t.Errorf("no posts/add for %s; requests: %v", testURL, rec.Requests())
+	}
+}
+
+// A dry run previews the same decisions: the URLs it would delete leave
+// knownURLs, so the second mover previews as a write, not a merge.
+func TestApplyBookmarkActions_DryRunForgetsDeletedURLs(t *testing.T) {
+	t.Parallel()
+
+	const moved = "http://example.net/moved"
+
+	chk := newTestChecker(t)
+	chk.dryRun, chk.verbose = true, true
+	chk.knownURLs = map[string]bool{
+		testURL: true, testNewURL: true, moved: true, testFinalURL: true,
+	}
+
+	chk.applyBookmarkActions([]BookmarkAction{
+		{Original: Bookmark{URL: testURL}, Action: ActionUpdate, NewURL: testNewURL},
+		{Original: Bookmark{URL: moved}, Action: ActionUpdate, NewURL: testURL},
+		{Original: Bookmark{URL: testFinalURL}, Action: ActionDelete},
+		// In place: its target is its own URL, which stays known.
+		{Original: Bookmark{URL: testNewURL}, Action: ActionUpdate, NewTitle: testTitle},
+	})
+
+	if merges := strings.Count(stdoutOf(chk), "Would merge:"); merges != 1 {
+		t.Errorf("previewed %d merges, want 1; output:\n%s", merges, stdoutOf(chk))
+	}
+	for gone, want := range map[string]bool{
+		moved: false, testURL: true, testFinalURL: false, testNewURL: true,
+	} {
+		if chk.knownURLs[gone] != want {
+			t.Errorf("knownURLs[%s] = %v, want %v", gone, chk.knownURLs[gone], want)
+		}
 	}
 }
 
 // Pinboard answers some endpoints with "result" rather than "result_code".
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestDecodePinboardResult_AcceptsResultField(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, `{"result":"done"}`)
-	useEndpoint(t, server.URL)
+	chk := newWriteChecker(t, staticServer(t, http.StatusOK, `{"result":"done"}`).URL)
 
-	if err := deleteBookmark(testToken, testURL); err != nil {
+	if err := chk.deleteBookmark(testURL); err != nil {
 		t.Errorf("deleteBookmark() error = %v, want nil for a `result` document", err)
 	}
 }
 
 // A body that is not the expected document must fail rather than be read as a
 // success: silently accepting garbage is how a rejected write looked applied.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestPinboardResponses_RejectMalformedJSON(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		body string
-		call func() error
+		call func(*checker) error
 	}{
 		{
 			name: "write result",
 			body: "not json at all",
-			call: func() error { return deleteBookmark(testToken, testURL) },
+			call: func(chk *checker) error { return chk.deleteBookmark(testURL) },
 		},
 		{
 			name: "bookmark list",
 			body: `{"not":"an array"}`,
-			call: func() error {
-				_, err := getBookmarks(testToken)
+			call: func(chk *checker) error {
+				_, err := chk.getBookmarks()
 
 				return err
 			},
@@ -627,8 +768,8 @@ func TestPinboardResponses_RejectMalformedJSON(t *testing.T) {
 		{
 			name: "tag suggestions",
 			body: "<suggested><popular>go</popular></suggested>",
-			call: func() error {
-				_, err := getSuggestedTags(testToken, testURL)
+			call: func(chk *checker) error {
+				_, err := chk.getSuggestedTags(testURL)
 
 				return err
 			},
@@ -637,110 +778,52 @@ func TestPinboardResponses_RejectMalformedJSON(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			resetStats(t)
+			t.Parallel()
 
-			server := staticServer(t, http.StatusOK, testCase.body)
-			useEndpoint(t, server.URL)
+			chk := newWriteChecker(t, staticServer(t, http.StatusOK, testCase.body).URL)
 
-			if err := testCase.call(); err == nil {
+			if err := testCase.call(chk); err == nil {
 				t.Error("error = nil, want a decode failure")
 			}
 		})
 	}
 }
 
-// Every shortener must report a transport failure rather than return an empty
-// URL that would later be judged a dead link.
-//
-//nolint:paralleltest // repoints the shortener endpoints
-func TestShorteners_ReportTransportFailures(t *testing.T) {
-	t.Run("is.gd", func(t *testing.T) {
-		useIsGdEndpoint(t, unreachableURL(t))
-
-		if _, err := unshortenIsGdImpl("https://is.gd/abc"); err == nil {
-			t.Error("unshortenIsGdImpl() error = nil, want a transport error")
-		}
-	})
-
-	t.Run("tinyurl", func(t *testing.T) {
-		if _, err := unshortenTinyURLImpl(unreachableURL(t)); err == nil {
-			t.Error("unshortenTinyURLImpl() error = nil, want a transport error")
-		}
-	})
-
-	t.Run("bitly", func(t *testing.T) {
-		t.Setenv(bitlyTokenName, "bitly-token")
-		useBitlyEndpoint(t, unreachableURL(t))
-
-		if _, err := unshortenBitlyImpl(testBitlyURL); err == nil {
-			t.Error("unshortenBitlyImpl() error = nil, want a transport error")
-		}
-	})
-}
-
-// A shortener answering with a malformed document must fail rather than yield
-// an empty URL.
-//
-//nolint:paralleltest // repoints the shortener endpoints
-func TestShorteners_RejectMalformedJSON(t *testing.T) {
-	t.Run("is.gd", func(t *testing.T) {
-		server := staticServer(t, http.StatusOK, "not json")
-		useIsGdEndpoint(t, server.URL)
-
-		if _, err := unshortenIsGdImpl("https://is.gd/abc"); err == nil {
-			t.Error("unshortenIsGdImpl() error = nil, want a decode failure")
-		}
-	})
-
-	t.Run("bitly", func(t *testing.T) {
-		t.Setenv(bitlyTokenName, "bitly-token")
-
-		server := staticServer(t, http.StatusOK, "not json")
-		useBitlyEndpoint(t, server.URL)
-
-		if _, err := unshortenBitlyImpl(testBitlyURL); err == nil {
-			t.Error("unshortenBitlyImpl() error = nil, want a decode failure")
-		}
-	})
-}
-
 // A failed lookup must yield no value and be counted as a failure. Returning a
 // partial or garbage title would write it to the bookmark.
-//
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestFetchIfNeeded_FailureYieldsNothingAndCounts(t *testing.T) {
-	t.Run("title", func(t *testing.T) {
-		resetStats(t)
-		setSkipFlags(t, false, true)
+	t.Parallel()
 
+	t.Run("title", func(t *testing.T) {
+		t.Parallel()
+
+		chk := newTestChecker(t)
 		server := staticServer(t, http.StatusNotFound, "")
 
-		if got := fetchTitleIfNeeded(Bookmark{URL: server.URL}, ""); got != "" {
+		if got := chk.fetchTitleIfNeeded(Bookmark{URL: server.URL}, ""); got != "" {
 			t.Errorf("fetchTitleIfNeeded() = %q, want empty on failure", got)
 		}
-		if stats.TitlesFailed != 1 {
-			t.Errorf("TitlesFailed = %d, want 1", stats.TitlesFailed)
+		if chk.stats.TitlesFailed != 1 {
+			t.Errorf("TitlesFailed = %d, want 1", chk.stats.TitlesFailed)
 		}
-		if stats.TitlesFetched != 0 {
-			t.Errorf("TitlesFetched = %d, want 0", stats.TitlesFetched)
+		if chk.stats.TitlesFetched != 0 {
+			t.Errorf("TitlesFetched = %d, want 0", chk.stats.TitlesFetched)
 		}
 	})
 
 	t.Run("tags", func(t *testing.T) {
-		resetStats(t)
-		setSkipFlags(t, true, false)
+		t.Parallel()
 
-		server := staticServer(t, http.StatusNotFound, "")
-		useEndpoint(t, server.URL)
+		chk := newWriteChecker(t, staticServer(t, http.StatusNotFound, "").URL)
 
-		if got := fetchTagsIfNeeded(Bookmark{URL: testURL}, testToken, ""); got != "" {
+		if got := chk.fetchTagsIfNeeded(Bookmark{URL: testURL}, ""); got != "" {
 			t.Errorf("fetchTagsIfNeeded() = %q, want empty on failure", got)
 		}
-		if stats.TagsFailed != 1 {
-			t.Errorf("TagsFailed = %d, want 1", stats.TagsFailed)
+		if chk.stats.TagsFailed != 1 {
+			t.Errorf("TagsFailed = %d, want 1", chk.stats.TagsFailed)
 		}
-		if stats.TagsFetched != 0 {
-			t.Errorf("TagsFetched = %d, want 0", stats.TagsFetched)
+		if chk.stats.TagsFetched != 0 {
+			t.Errorf("TagsFetched = %d, want 0", chk.stats.TagsFetched)
 		}
 	})
 }
@@ -749,41 +832,39 @@ func TestFetchIfNeeded_FailureYieldsNothingAndCounts(t *testing.T) {
 // ordinary: most pages Pinboard has no tag suggestions for, and a page may
 // carry no <title> at all. Counting them as failures made a run where every
 // response was 200 report hundreds of them.
-//
-//nolint:paralleltest // mutates the skip flags and the stats singleton
 func TestFetchIfNeeded_EmptyResultIsNotAFailure(t *testing.T) {
+	t.Parallel()
+
 	t.Run("tags with no suggestions", func(t *testing.T) {
-		resetStats(t)
-		setSkipFlags(t, true, false)
+		t.Parallel()
 
-		server := staticServer(t, http.StatusOK, `[]`)
-		useEndpoint(t, server.URL)
+		chk := newWriteChecker(t, staticServer(t, http.StatusOK, `[]`).URL)
 
-		if got := fetchTagsIfNeeded(Bookmark{URL: testURL}, testToken, ""); got != "" {
+		if got := chk.fetchTagsIfNeeded(Bookmark{URL: testURL}, ""); got != "" {
 			t.Errorf("fetchTagsIfNeeded() = %q, want empty when nothing is suggested", got)
 		}
-		if stats.TagsEmpty != 1 {
-			t.Errorf("TagsEmpty = %d, want 1", stats.TagsEmpty)
+		if chk.stats.TagsEmpty != 1 {
+			t.Errorf("TagsEmpty = %d, want 1", chk.stats.TagsEmpty)
 		}
-		if stats.TagsFailed != 0 {
-			t.Errorf("TagsFailed = %d, want 0; the call succeeded", stats.TagsFailed)
+		if chk.stats.TagsFailed != 0 {
+			t.Errorf("TagsFailed = %d, want 0; the call succeeded", chk.stats.TagsFailed)
 		}
 	})
 
 	t.Run("title on a page without one", func(t *testing.T) {
-		resetStats(t)
-		setSkipFlags(t, false, true)
+		t.Parallel()
 
+		chk := newTestChecker(t)
 		server := staticServer(t, http.StatusOK, "<html><body>no title here</body></html>")
 
-		if got := fetchTitleIfNeeded(Bookmark{URL: server.URL}, ""); got != "" {
+		if got := chk.fetchTitleIfNeeded(Bookmark{URL: server.URL}, ""); got != "" {
 			t.Errorf("fetchTitleIfNeeded() = %q, want empty when the page has no title", got)
 		}
-		if stats.TitlesEmpty != 1 {
-			t.Errorf("TitlesEmpty = %d, want 1", stats.TitlesEmpty)
+		if chk.stats.TitlesEmpty != 1 {
+			t.Errorf("TitlesEmpty = %d, want 1", chk.stats.TitlesEmpty)
 		}
-		if stats.TitlesFailed != 0 {
-			t.Errorf("TitlesFailed = %d, want 0; the fetch succeeded", stats.TitlesFailed)
+		if chk.stats.TitlesFailed != 0 {
+			t.Errorf("TitlesFailed = %d, want 0; the fetch succeeded", chk.stats.TitlesFailed)
 		}
 	})
 }
@@ -791,10 +872,8 @@ func TestFetchIfNeeded_EmptyResultIsNotAFailure(t *testing.T) {
 // A connection that dies mid-body must fail rather than yield whatever was
 // parsed from the fragment received so far, which would be written to the
 // bookmark as its title.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestGetPageTitle_TruncatedResponse(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -816,7 +895,7 @@ func TestGetPageTitle_TruncatedResponse(t *testing.T) {
 	// The handler panic is deliberate; keep it out of the test log.
 	server.Config.ErrorLog = discardLogger()
 
-	if _, err := getPageTitle(server.URL); err == nil {
+	if _, err := newTestChecker(t).getPageTitle(server.URL); err == nil {
 		t.Error("getPageTitle() error = nil, want a failure on a truncated body")
 	}
 }
@@ -827,21 +906,18 @@ func discardLogger() *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
-//nolint:paralleltest // writes to the stats singleton
 func TestGetPageTitle_TransportFailure(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	if _, err := getPageTitle(unreachableURL(t)); err == nil {
+	if _, err := newTestChecker(t).getPageTitle(unreachableURL(t)); err == nil {
 		t.Error("getPageTitle() error = nil, want a transport error")
 	}
 }
 
 // getPageTitle must reject a body that is not parseable as a document rather
 // than write whatever it extracted into the bookmark title.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestGetPageTitle_UnparseableContentType(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -852,25 +928,20 @@ func TestGetPageTitle_UnparseableContentType(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	if _, err := getPageTitle(server.URL); err == nil {
+	if _, err := newTestChecker(t).getPageTitle(server.URL); err == nil {
 		t.Error("getPageTitle() error = nil, want an unparseable Content-Type error")
 	}
 }
 
 // updateBookmark prefers freshly fetched tags over the bookmark's existing set.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestUpdateBookmark_PrefersNewTags(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	rec := newRecordingServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		writeBody(t, w, `{"result_code":"done"}`)
-	})
-	useEndpoint(t, rec.URL)
+	rec := okServer(t)
+	chk := newWriteChecker(t, rec.URL)
 
 	bookmark := Bookmark{URL: testURL, Tags: "old"}
-	if err := updateBookmark(testToken, bookmark, testURL, "", "fresh,tags"); err != nil {
+	if err := chk.updateBookmark(bookmark, testURL, "", "fresh,tags"); err != nil {
 		t.Fatalf("updateBookmark() error = %v, want nil", err)
 	}
 

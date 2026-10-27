@@ -1,12 +1,12 @@
 // main_test.go holds the suite's shared fixtures and helpers alongside the
-// tests for title extraction, tag suggestion, and URL shortener expansion.
+// tests for title extraction and tag suggestion.
 package main
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -28,37 +28,80 @@ const (
 	testTagAlt   = "code"
 	testTagList  = "tags"
 	testFTPURL   = "ftp://ftp.example.com/file"
+	testTime     = "2020-01-02T03:04:05Z"
+	// testDoneBody is Pinboard's answer to an accepted write.
+	testDoneBody = `{"result_code":"done"}`
 	// testBadURL fails url.Parse: the IPv6 literal is never closed.
 	testBadURL = "http://[::1"
 )
 
-// TestMain shortens the global rate limiter for the whole suite and disables
-// the per-host throttle. The production intervals are three seconds per
-// Pinboard call and half a second per bookmarked host, which would dominate the
-// run time; these tests exercise the request logic, not the pacing. The pacing
-// itself is asserted by TestWaitForHost_SpacesRequestsToOneHost, which restores
-// a real interval for its own duration.
-func TestMain(m *testing.M) {
-	rateLimitInterval = time.Millisecond
-	rateLimiter.Reset(time.Millisecond)
-	perHostInterval = 0
+// lockedBuffer is an output stream a test can read back. It is locked because
+// the worker pool writes -verbose narration from many goroutines at once, and a
+// bare bytes.Buffer under those writes is a data race.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
 
-	// httptest serves on 127.0.0.1, which the real guard correctly rejects as
-	// non-public. Bypassing it here keeps the redirect and shortener tests
-	// about redirects and shorteners; the guard is tested directly in
-	// TestIsPublicHostImpl.
-	isPublicHost = func(string) bool { return true }
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	os.Exit(m.Run())
+	return b.buf.Write(p) //nolint:wrapcheck // bytes.Buffer.Write never fails
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// newTestChecker returns a checker of the test's own, so the test can run in
+// parallel with every other: the run state that tests used to swap in and out
+// of package globals is all on the checker now.
+//
+// The pacing is shortened and the private-address guard bypassed. The
+// production intervals are three seconds per Pinboard call and half a second
+// per bookmarked host, which would dominate the run time, and httptest serves
+// on 127.0.0.1, which the real guard correctly rejects. The pacing and the
+// guard are tested directly, on checkers that restore them.
+func newTestChecker(t *testing.T) *checker {
+	t.Helper()
+
+	chk := newChecker(&lockedBuffer{}, &lockedBuffer{})
+	chk.apiToken = testToken
+	chk.limiter = newRateLimiter(time.Millisecond)
+	chk.hosts = newHostThrottle(0)
+	chk.isPublicHost = func(string) bool { return true }
+
+	return chk
+}
+
+// stdoutOf returns everything the checker wrote to its report stream.
+func stdoutOf(chk *checker) string {
+	return bufferText(chk.out)
+}
+
+// stderrOf returns everything the checker wrote to its diagnostic stream.
+func stderrOf(chk *checker) string {
+	return bufferText(chk.errOut)
+}
+
+// bufferText reads back a stream newTestChecker installed. A stream of any
+// other type yields "", which fails every assertion that expects output.
+func bufferText(stream io.Writer) string {
+	buf, ok := stream.(*lockedBuffer)
+	if !ok {
+		return ""
+	}
+
+	return buf.String()
 }
 
 // swap sets *target to value for the duration of the test and restores the
-// previous value afterwards.
-//
-// Written once because the capture-assign-restore ordering is easy to get
-// subtly wrong, and a missed restore does not fail the test that caused it — it
-// surfaces later as an unrelated failure or, when parallel tests are involved,
-// as a data race.
+// previous value afterwards. Only the process-level seams use it now — osExit,
+// readBuildInfo, version — so every test that calls it stays serial.
 func swap[T any](t *testing.T, target *T, value T) {
 	t.Helper()
 
@@ -66,52 +109,6 @@ func swap[T any](t *testing.T, target *T, value T) {
 	*target = value
 
 	t.Cleanup(func() { *target = previous })
-}
-
-// resetStats gives a test its own counters. stats is a package-level singleton
-// that every code path writes to, so without this a test would assert on totals
-// accumulated by whatever ran before it.
-func resetStats(t *testing.T) {
-	t.Helper()
-	swap(t, &stats, newStatistics())
-}
-
-// useEndpoint points pinboardAPIEndpoint at a test server for one test.
-func useEndpoint(t *testing.T, endpoint string) {
-	t.Helper()
-	swap(t, &pinboardAPIEndpoint, endpoint)
-}
-
-// useBitlyEndpoint points bitlyEndpoint at a test server for one test.
-func useBitlyEndpoint(t *testing.T, endpoint string) {
-	t.Helper()
-	swap(t, &bitlyEndpoint, endpoint)
-}
-
-// useIsGdEndpoint points isGdEndpoint at a test server for one test.
-func useIsGdEndpoint(t *testing.T, endpoint string) {
-	t.Helper()
-	swap(t, &isGdEndpoint, endpoint)
-}
-
-// setSkipFlags sets the two feature toggles for one test and restores them
-// afterwards, so a test never inherits whatever a previous one left behind.
-func setSkipFlags(t *testing.T, titles, autoTags bool) {
-	t.Helper()
-	swap(t, &skipTitles, titles)
-	swap(t, &skipAutoTags, autoTags)
-}
-
-// setVerbose sets the verbose toggle for one test and restores it afterwards.
-func setVerbose(t *testing.T, value bool) {
-	t.Helper()
-	swap(t, &verbose, value)
-}
-
-// setCIMode sets the CI toggle for one test and restores it afterwards.
-func setCIMode(t *testing.T, value bool) {
-	t.Helper()
-	swap(t, &ciMode, value)
 }
 
 // recordingServer answers requests with a handler while recording what was
@@ -176,264 +173,8 @@ func staticServer(t *testing.T, status int, body string) *httptest.Server {
 	return server
 }
 
-//nolint:paralleltest // mutates the shortener seam and the stats singleton
-func TestExpandURL_Bitly(t *testing.T) {
-	resetStats(t)
-
-	swap(t, &unshortenBitly, func(_ string) (string, error) {
-		return "https://expanded.example.com", nil
-	})
-
-	got, err := expandURL("https://bit.ly/test", false)
-	if err != nil {
-		t.Fatalf("expandURL() error = %v, want nil", err)
-	}
-	if got != "https://expanded.example.com" {
-		t.Errorf("expandURL() = %q, want the expanded URL", got)
-	}
-	if stats.ShortURLsExpanded[svcBitly] != 1 {
-		t.Errorf("expected one recorded bitly expansion, got %d",
-			stats.ShortURLsExpanded[svcBitly])
-	}
-}
-
-// A shortener that cannot resolve a link must not report an error: expandURL's
-// error routed the bookmark to deletion, so a Bitly outage deleted bookmarks.
-//
-//nolint:paralleltest // mutates the shortener seam and the stats singleton
-func TestExpandURL_ShortenerFailureKeepsOriginal(t *testing.T) {
-	resetStats(t)
-
-	// Any failure will do; the specific error is not asserted.
-	swap(t, &unshortenIsGd, func(_ string) (string, error) { return "", errNoBitlyToken })
-
-	const short = "https://is.gd/test"
-
-	got, err := expandURL(short, false)
-	if err != nil {
-		t.Fatalf("expandURL() error = %v, want nil for a failed expansion", err)
-	}
-	if got != short {
-		t.Errorf("expandURL() = %q, want the original URL %q", got, short)
-	}
-	if stats.ShortURLsFailed[svcIsGd] != 1 {
-		t.Errorf("expected one recorded is.gd failure, got %d", stats.ShortURLsFailed[svcIsGd])
-	}
-}
-
-func TestExpandURL_NoExpansionNeeded(t *testing.T) {
-	t.Parallel()
-
-	const regularURL = "https://example.com/page"
-
-	got, err := expandURL(regularURL, false)
-	if err != nil {
-		t.Fatalf("expandURL() error = %v, want nil", err)
-	}
-	if got != regularURL {
-		t.Errorf("expandURL() = %q, want %q", got, regularURL)
-	}
-}
-
-// Serial: each case repoints the package-level isGdEndpoint.
-//
-//nolint:paralleltest // repoints isGdEndpoint
-func TestUnshortenIsGdImpl(t *testing.T) {
-	tests := []struct {
-		name    string
-		status  int
-		body    string
-		want    string
-		wantErr bool
-	}{
-		{
-			name:   "expands from the url field",
-			status: http.StatusOK,
-			body:   `{"url":"https://example.com/final"}`,
-			want:   "https://example.com/final",
-		},
-		{
-			// The old implementation returned this whole document as the URL.
-			name:    "reports an is.gd error code",
-			status:  http.StatusOK,
-			body:    `{"errorcode":1,"errormessage":"unknown shorturl"}`,
-			wantErr: true,
-		},
-		{
-			name:    "rejects a non-200 response",
-			status:  http.StatusInternalServerError,
-			body:    "",
-			wantErr: true,
-		},
-		{
-			name:    "rejects an empty url field",
-			status:  http.StatusOK,
-			body:    `{"url":""}`,
-			wantErr: true,
-		},
-	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			server := staticServer(t, testCase.status, testCase.body)
-
-			useIsGdEndpoint(t, server.URL)
-
-			got, err := unshortenIsGdImpl("https://is.gd/abc")
-			if (err != nil) != testCase.wantErr {
-				t.Fatalf("unshortenIsGdImpl() error = %v, wantErr %v", err, testCase.wantErr)
-			}
-			if got != testCase.want {
-				t.Errorf("unshortenIsGdImpl() = %q, want %q", got, testCase.want)
-			}
-		})
-	}
-}
-
-func TestUnshortenTinyURLImpl(t *testing.T) {
-	t.Parallel()
-
-	t.Run("follows the redirect", func(t *testing.T) {
-		t.Parallel()
-
-		const target = "https://example.com/final"
-
-		server := httptest.NewServer(http.HandlerFunc(
-			func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Location", target)
-				w.WriteHeader(http.StatusMovedPermanently)
-			}))
-		t.Cleanup(server.Close)
-
-		got, err := unshortenTinyURLImpl(server.URL)
-		if err != nil {
-			t.Fatalf("unshortenTinyURLImpl() error = %v, want nil", err)
-		}
-		if got != target {
-			t.Errorf("unshortenTinyURLImpl() = %q, want %q", got, target)
-		}
-	})
-
-	t.Run("errors when there is no redirect", func(t *testing.T) {
-		t.Parallel()
-
-		server := staticServer(t, http.StatusOK, "not a redirect")
-
-		if _, err := unshortenTinyURLImpl(server.URL); err == nil {
-			t.Error("unshortenTinyURLImpl() error = nil, want an error without a Location")
-		}
-	})
-}
-
-const testBitlyURL = "https://bit.ly/test"
-
-//nolint:paralleltest // uses t.Setenv
-func TestUnshortenBitlyImpl_RequiresToken(t *testing.T) {
-	t.Setenv(bitlyTokenName, "")
-
-	if _, err := unshortenBitlyImpl(testBitlyURL); err == nil {
-		t.Error("unshortenBitlyImpl() error = nil, want an error without a token")
-	}
-}
-
-//nolint:paralleltest // uses t.Setenv and repoints bitlyEndpoint
-func TestUnshortenBitlyImpl_SendsBitlinkIDAndReadsLongURL(t *testing.T) {
-	t.Setenv(bitlyTokenName, "bitly-token")
-
-	var (
-		gotAuth string
-		gotBody string
-	)
-
-	server := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			gotAuth = r.Header.Get("Authorization")
-
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("failed to read request body: %v", err)
-			}
-			gotBody = string(body)
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			writeBody(t, w, `{"long_url":"`+testAbsURL+`"}`)
-		}))
-	t.Cleanup(server.Close)
-
-	useBitlyEndpoint(t, server.URL)
-
-	got, err := unshortenBitlyImpl(testBitlyURL)
-	if err != nil {
-		t.Fatalf("unshortenBitlyImpl() error = %v, want nil", err)
-	}
-	if got != testAbsURL {
-		t.Errorf("unshortenBitlyImpl() = %q, want %q", got, testAbsURL)
-	}
-	if gotAuth != "Bearer bitly-token" {
-		t.Errorf("Authorization = %q, want a bearer token", gotAuth)
-	}
-	// bitlink_id carries host and path with no scheme; the old code sent a
-	// short_url field the endpoint does not accept.
-	if !strings.Contains(gotBody, `"bitlink_id":"bit.ly/test"`) {
-		t.Errorf("request body = %q, want a bitlink_id field", gotBody)
-	}
-}
-
-// The old code returned ("", nil) here, and the empty URL was then judged a
-// dead link and the bookmark deleted.
-//
-//nolint:paralleltest // uses t.Setenv and repoints bitlyEndpoint
-func TestUnshortenBitlyImpl_RejectsNon200(t *testing.T) {
-	t.Setenv(bitlyTokenName, "bitly-token")
-
-	server := staticServer(t, http.StatusForbidden, `{"message":"FORBIDDEN"}`)
-	useBitlyEndpoint(t, server.URL)
-
-	got, err := unshortenBitlyImpl(testBitlyURL)
-	if err == nil {
-		t.Error("unshortenBitlyImpl() error = nil, want an error on HTTP 403")
-	}
-	if got != "" {
-		t.Errorf("unshortenBitlyImpl() = %q, want empty on error", got)
-	}
-}
-
-func TestValidExpandedURL(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		input   string
-		want    string
-		wantErr bool
-	}{
-		{name: "absolute URL", input: testAbsURL, want: testAbsURL},
-		{name: "trims whitespace", input: " https://example.com/x\n", want: testAbsURL},
-		{name: "rejects empty", input: "", wantErr: true},
-		{name: "rejects relative", input: "/just/a/path", wantErr: true},
-		{name: "rejects an error page", input: "Error: no such short URL", wantErr: true},
-		{name: "rejects an unparseable URL", input: testBadURL, wantErr: true},
-	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := validExpandedURL(testCase.input)
-			if (err != nil) != testCase.wantErr {
-				t.Fatalf("validExpandedURL() error = %v, wantErr %v", err, testCase.wantErr)
-			}
-			if got != testCase.want {
-				t.Errorf("validExpandedURL() = %q, want %q", got, testCase.want)
-			}
-		})
-	}
-}
-
-//nolint:paralleltest // writes to the stats singleton via RecordHTTPStatus
 func TestGetPageTitle(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	tests := []struct {
 		name        string
@@ -499,6 +240,8 @@ func TestGetPageTitle(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
 			server := httptest.NewServer(http.HandlerFunc(
 				func(w http.ResponseWriter, _ *http.Request) {
 					if testCase.contentType != "" {
@@ -511,7 +254,7 @@ func TestGetPageTitle(t *testing.T) {
 				}))
 			defer server.Close()
 
-			got, err := getPageTitle(server.URL)
+			got, err := newTestChecker(t).getPageTitle(server.URL)
 			if (err != nil) != testCase.wantErr {
 				t.Fatalf("getPageTitle() error = %v, wantErr %v", err, testCase.wantErr)
 			}
@@ -522,14 +265,13 @@ func TestGetPageTitle(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // writes to the stats singleton
 func TestGetPageTitle_TruncatesToPinboardLimit(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	long := strings.Repeat("ä", maxPinboardTitleLen+50)
 	server := staticServer(t, http.StatusOK, "<html><head><title>"+long+"</title></head></html>")
 
-	got, err := getPageTitle(server.URL)
+	got, err := newTestChecker(t).getPageTitle(server.URL)
 	if err != nil {
 		t.Fatalf("getPageTitle() error = %v, want nil", err)
 	}
@@ -539,9 +281,49 @@ func TestGetPageTitle_TruncatesToPinboardLimit(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint and the stats singleton
+// A redirect during the title fetch leads to a page the bookmark does not
+// point at; a login wall answers an anonymous GET with one. Following it
+// titled the bookmark "Sign in to …", so no title is taken and the target is
+// never requested.
+func TestGetPageTitle_TakesNoTitleThroughARedirect(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{
+		http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+
+			loginRequests := 0
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/login" {
+						loginRequests++
+						writeBody(t, w, "<html><head><title>Sign in to Example</title></head></html>")
+
+						return
+					}
+					http.Redirect(w, r, "/login", status)
+				}))
+			t.Cleanup(server.Close)
+
+			title, err := newTestChecker(t).getPageTitle(server.URL + "/private/doc")
+			if err == nil {
+				t.Errorf("getPageTitle() error = nil, want one for a %d answer", status)
+			}
+			if title != "" {
+				t.Errorf("getPageTitle() = %q, want no title from the redirect target", title)
+			}
+			if loginRequests != 0 {
+				t.Errorf("the redirect target got %d requests, want none", loginRequests)
+			}
+		})
+	}
+}
+
 func TestGetSuggestedTags(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	tests := []struct {
 		name     string
@@ -582,10 +364,12 @@ func TestGetSuggestedTags(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			server := staticServer(t, testCase.status, testCase.body)
-			useEndpoint(t, server.URL)
+			t.Parallel()
 
-			got, err := getSuggestedTags(testToken, testURL)
+			chk := newTestChecker(t)
+			chk.pinboardEndpoint = staticServer(t, testCase.status, testCase.body).URL
+
+			got, err := chk.getSuggestedTags(testURL)
 			if (err != nil) != testCase.wantErr {
 				t.Fatalf("getSuggestedTags() error = %v, wantErr %v", err, testCase.wantErr)
 			}
@@ -603,18 +387,18 @@ func TestGetSuggestedTags(t *testing.T) {
 
 // getSuggestedTags must ask for JSON: Pinboard answers in XML by default, so
 // omitting the parameter made every decode fail.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint and the stats singleton
 func TestGetSuggestedTags_RequestsJSON(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	rec := newRecordingServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		writeBody(t, w, `[{"popular":["go"]}]`)
 	})
-	useEndpoint(t, rec.URL)
 
-	if _, err := getSuggestedTags(testToken, testURL); err != nil {
+	chk := newTestChecker(t)
+	chk.pinboardEndpoint = rec.URL
+
+	if _, err := chk.getSuggestedTags(testURL); err != nil {
 		t.Fatalf("getSuggestedTags() error = %v, want nil", err)
 	}
 
@@ -627,15 +411,14 @@ func TestGetSuggestedTags_RequestsJSON(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // writes to the stats singleton
 func TestGetSuggestedTags_CapsTagCount(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK,
-		`[{"popular":["a","b","c","d","e","f","g","h","i","j","k","l"]}]`)
-	useEndpoint(t, server.URL)
+	chk := newTestChecker(t)
+	chk.pinboardEndpoint = staticServer(t, http.StatusOK,
+		`[{"popular":["a","b","c","d","e","f","g","h","i","j","k","l"]}]`).URL
 
-	got, err := getSuggestedTags(testToken, testURL)
+	got, err := chk.getSuggestedTags(testURL)
 	if err != nil {
 		t.Fatalf("getSuggestedTags() error = %v, want nil", err)
 	}

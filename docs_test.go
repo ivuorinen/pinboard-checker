@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // readmeText returns README.md, failing the test if it cannot be read.
@@ -69,6 +70,10 @@ func TestREADME_QuotesCurrentConstants(t *testing.T) {
 		t.Errorf("maxSuggestedTags = %d but README says 'up to 9 suggested tags'",
 			maxSuggestedTags)
 	}
+	if progressReportInterval != 15*time.Second || !strings.Contains(readme, "every 15 seconds") {
+		t.Errorf("progressReportInterval = %s but README says 'every 15 seconds'",
+			progressReportInterval)
+	}
 	if maxWorkers != 100 || !strings.Contains(readme, "1-100") {
 		t.Errorf("maxWorkers = %d but README says the range is 1-100", maxWorkers)
 	}
@@ -86,18 +91,9 @@ func TestREADME_DocumentsEveryFlag(t *testing.T) {
 	readme := readmeText(t)
 
 	// Registered through the same function cli() uses, so this test cannot
-	// drift from the real flag set the way a hand-copied list did. The four
-	// toggles cli binds to package globals are added here the same way.
-	var (
-		probe                                     = flag.NewFlagSet("probe", flag.ContinueOnError)
-		verboseF, ciF, skipTitlesF, skipAutoTagsF bool
-	)
-
+	// drift from the real flag set the way a hand-copied list did.
+	probe := flag.NewFlagSet("probe", flag.ContinueOnError)
 	registerFlags(probe)
-	probe.BoolVar(&verboseF, "verbose", false, "")
-	probe.BoolVar(&ciF, "ci", false, "")
-	probe.BoolVar(&skipTitlesF, "skip-titles", false, "")
-	probe.BoolVar(&skipAutoTagsF, "skip-auto-tags", false, "")
 
 	probe.VisitAll(func(f *flag.Flag) {
 		if !strings.Contains(readme, "`-"+f.Name) {
@@ -106,8 +102,8 @@ func TestREADME_DocumentsEveryFlag(t *testing.T) {
 	})
 }
 
-// Both environment variables the program reads must be documented in the README
-// and present in .env.example, or a user cannot discover them.
+// The environment variable the program reads must be documented in the README
+// and present in .env.example, or a user cannot discover it.
 func TestREADME_DocumentsEnvironment(t *testing.T) {
 	t.Parallel()
 
@@ -118,21 +114,19 @@ func TestREADME_DocumentsEnvironment(t *testing.T) {
 		t.Fatalf("failed to read .env.example: %v", err)
 	}
 
-	for _, name := range []string{tokenName, bitlyTokenName} {
-		if !strings.Contains(readme, name) {
-			t.Errorf("%s is not documented in README.md", name)
-		}
-		if !strings.Contains(string(example), name) {
-			t.Errorf("%s is missing from .env.example", name)
-		}
+	if !strings.Contains(readme, tokenName) {
+		t.Errorf("%s is not documented in README.md", tokenName)
+	}
+	if !strings.Contains(string(example), tokenName) {
+		t.Errorf("%s is missing from .env.example", tokenName)
 	}
 }
 
-// The statistics section names two counters by the label the report prints. If
+// The statistics section names its counters by the label the report prints. If
 // a label is reworded, the README must be reworded with it.
-//
-//nolint:paralleltest // captureOutput swaps the global os.Stdout
 func TestREADME_MatchesPrintedCounterLabels(t *testing.T) {
+	t.Parallel()
+
 	readme := readmeText(t)
 
 	report := newStatistics()
@@ -140,10 +134,14 @@ func TestREADME_MatchesPrintedCounterLabels(t *testing.T) {
 	report.Skipped = 1
 	report.ApplyErrors = 1
 	report.UpdatesPerformed = 1
+	report.Merged = 1
 
-	printed := captureOutput(report.Print)
+	var buf strings.Builder
 
-	for _, label := range []string{"Skipped (unchecked)", "Writes rejected"} {
+	report.Print(&buf)
+	printed := buf.String()
+
+	for _, label := range []string{"Skipped (unchecked)", "Writes rejected", "Duplicates merged"} {
 		if !strings.Contains(printed, label) {
 			t.Errorf("the report no longer prints %q", label)
 		}
@@ -179,6 +177,6 @@ func TestREADME_HasNoRetiredClaims(t *testing.T) {
 
 	// A hardcoded Go version reintroduces the drift the go.mod pointer removed.
 	if strings.Contains(readme, "Go 1.2") {
-		t.Error("README hardcodes a Go version; point at the go directive in go.mod instead")
+		t.Error("README hardcodes a Go version; point at the toolchain line in go.mod instead")
 	}
 }

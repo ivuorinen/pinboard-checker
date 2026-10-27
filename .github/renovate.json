@@ -2,5 +2,13 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>ivuorinen/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "Toolchain bumps change the stdlib in every release binary: fix, not chore",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["toolchain"],
+      "semanticCommitType": "fix"
+    }
   ]
 }
