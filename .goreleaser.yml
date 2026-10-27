@@ -114,8 +114,9 @@ release:
   header: |
     ## pinboard-checker v{{ .Version }} ({{ .Date }})
 
-    Checks and repairs Pinboard bookmarks: expands shortened URLs, follows
-    redirects, fills in missing titles and tags, and reports dead links.
+    Checks and repairs Pinboard bookmarks: follows permanent redirects, fills
+    in missing titles and tags, and deletes bookmarks whose server reports them
+    gone (404/410).
 
   footer: |
     ## Installation
@@ -146,13 +147,16 @@ changelog:
       - "typo"
       - "Merge pull request"
       - "Merge branch"
+  # Groups are tried in order and the first match wins. Security comes first and
+  # matches Renovate's `[security]` suffix: no Conventional Commits type is named
+  # "security", so a `^security` pattern never matched anything.
   groups:
+    - title: "🔒 Security"
+      regexp: '\[security\]'
     - title: "🚀 Features"
       regexp: "^feat"
     - title: "🐛 Bug Fixes"
       regexp: "^fix"
-    - title: "🔒 Security"
-      regexp: "^security"
     - title: "⚡ Performance"
       regexp: "^perf"
     - title: "♻️ Refactoring"
