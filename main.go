@@ -1706,6 +1706,11 @@ func (c *checker) expandAndCheckURL(urlString string) (string, error) {
 // answer, but the URL written back advances only while every hop so far was
 // permanent. Persisting a 302 rewrote each session-gated bookmark to its login
 // page; see isPermanentRedirect.
+//
+// A chain that has not ended within maxRedirectHops is unverifiable: the last
+// Location was never requested. Returning it rewrote bookmarks to addresses
+// nobody had checked, and a permanent A↔B cycle wrote each bookmark onto the
+// other, so the apply phase merged one into the other and deleted both.
 func (c *checker) followRedirects(urlString string) (string, error) {
 	current := urlString
 	rewrite := urlString
@@ -1734,9 +1739,7 @@ func (c *checker) followRedirects(urlString string) (string, error) {
 		current = redirect
 	}
 
-	// Chain longer than the hop limit: keep the furthest permanent URL rather
-	// than reporting a bookmark as broken because it redirects a lot.
-	return rewrite, nil
+	return "", fmt.Errorf("%w: redirect chain longer than %d hops", errUnverifiable, maxRedirectHops)
 }
 
 // followableRedirect refuses a redirect target this tool must not follow: a

@@ -627,7 +627,8 @@ func TestFollowRedirects_WalksChain(t *testing.T) {
 	}
 }
 
-// A redirect cycle must stop at the hop limit rather than loop forever.
+// A redirect cycle must stop at the hop limit rather than loop forever, and
+// the bookmark is unverifiable there: the chain's end was never requested.
 func TestFollowRedirects_StopsAtHopLimit(t *testing.T) {
 	t.Parallel()
 
@@ -639,15 +640,46 @@ func TestFollowRedirects_StopsAtHopLimit(t *testing.T) {
 			requests++
 			// Points at itself under a fresh path so every hop is distinct.
 			w.Header().Set("Location", server.URL+"/next")
-			w.WriteHeader(http.StatusFound)
+			w.WriteHeader(http.StatusMovedPermanently)
 		}))
 	t.Cleanup(server.Close)
 
-	if _, err := newTestChecker(t).followRedirects(server.URL); err != nil {
-		t.Fatalf("followRedirects() error = %v, want nil at the hop limit", err)
+	got, err := newTestChecker(t).followRedirects(server.URL)
+	if !errors.Is(err, errUnverifiable) {
+		t.Fatalf("followRedirects() = %q, %v; want errUnverifiable at the hop limit", got, err)
 	}
-	if requests > maxRedirectHops {
-		t.Errorf("issued %d requests, want at most %d", requests, maxRedirectHops)
+	if requests != maxRedirectHops {
+		t.Errorf("issued %d requests, want %d", requests, maxRedirectHops)
+	}
+}
+
+// Two bookmarks that permanently redirect to each other used to be written onto
+// each other's URL; the apply phase then merged one into the other and deleted
+// both. Each is now skipped, so nothing is written or deleted.
+func TestProcessBookmark_PermanentCycleIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			target := "/a"
+			if r.URL.Path == "/a" {
+				target = "/b"
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		}))
+	t.Cleanup(server.Close)
+
+	chk := newTestChecker(t)
+
+	for _, path := range []string{"/a", "/b"} {
+		action := chk.processBookmark(Bookmark{URL: server.URL + path, Title: "t", Tags: "x"})
+		if action.Action != ActionNoChange || !errors.Is(action.Error, errUnverifiable) {
+			t.Errorf("processBookmark(%s) = action %d, error %v; want a skip", path,
+				action.Action, action.Error)
+		}
+	}
+	if chk.stats.Skipped != 2 {
+		t.Errorf("Skipped = %d, want 2", chk.stats.Skipped)
 	}
 }
 

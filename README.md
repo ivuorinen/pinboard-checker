@@ -182,7 +182,8 @@ pinboard-checker -ci
    - Follows the redirect chain (up to 5 hops). Only permanent redirects (301, 308)
      are written back; a 302, 303 or 307 is followed for the check but the bookmark
      keeps its URL, because a login wall answers an anonymous request with exactly
-     that
+     that. A chain that has not ended after 5 hops, such as two URLs redirecting
+     to each other, is skipped and counted: its end was never checked
    - Checks the **final** URL, and only it: a 404 or 410 marks the bookmark dead,
      anything else keeps it. The repairs above run first on purpose — their whole
      point is to turn a URL that fails right now into one that works
