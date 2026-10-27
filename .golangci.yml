@@ -189,8 +189,6 @@ linters:
           allow:
             - $gostd
             - github.com/ivuorinen/pinboard-checker
-            - github.com/joho/godotenv
-            - github.com/schollz/progressbar
             - golang.org/x/net
           deny:
             - pkg: "io/ioutil"

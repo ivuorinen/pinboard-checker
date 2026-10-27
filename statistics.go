@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"slices"
@@ -9,15 +10,10 @@ import (
 	"time"
 )
 
-// newStatistics builds a Statistics with its maps ready. Every caller needs the
-// same three maps initialized, and a nil map panics on write, so construction
-// lives here rather than being repeated at each literal.
+// newStatistics builds a Statistics with its map ready. A nil map panics on
+// write, so construction lives here rather than being repeated at each literal.
 func newStatistics() *Statistics {
-	return &Statistics{
-		ShortURLsExpanded: make(map[string]int),
-		ShortURLsFailed:   make(map[string]int),
-		StatusCodes:       make(map[string]map[int]int),
-	}
+	return &Statistics{StatusCodes: make(map[string]map[int]int)}
 }
 
 type Statistics struct {
@@ -44,10 +40,8 @@ type Statistics struct {
 	TagsAdded   int
 
 	// URL processing
-	ShortURLsExpanded map[string]int // "bitly", "tinyurl", "isgd"
-	ShortURLsFailed   map[string]int
-	ParenthesesFixed  int
-	Redirects         int
+	ParenthesesFixed int
+	Redirects        int
 
 	// HTTP status codes by operation type
 	StatusCodes map[string]map[int]int // operation -> status code -> count
@@ -114,6 +108,16 @@ func (s *Statistics) ApplyErrorCount() int {
 	return s.ApplyErrors
 }
 
+// CISummary is the one line -ci prints in place of the report. It counts what
+// was done rather than what was planned, so a dry run reports zero writes.
+func (s *Statistics) CISummary() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return fmt.Sprintf("updated %d, deleted %d, merged %d, skipped %d, rejected %d",
+		s.UpdatesPerformed, s.DeletionsPerformed, s.Merged, s.Skipped, s.ApplyErrors)
+}
+
 func (s *Statistics) RecordAction(action BookmarkAction) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,17 +149,6 @@ func (s *Statistics) RecordHTTPStatus(operation string, statusCode int) {
 		s.StatusCodes[operation] = make(map[int]int)
 	}
 	s.StatusCodes[operation][statusCode]++
-}
-
-func (s *Statistics) RecordShortenerExpansion(service string, success bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if success {
-		s.ShortURLsExpanded[service]++
-	} else {
-		s.ShortURLsFailed[service]++
-	}
 }
 
 func (s *Statistics) IncrementParenthesesFixed() {
@@ -220,23 +213,23 @@ func (s *Statistics) IncrementDeletions() {
 	s.DeletionsPerformed++
 }
 
-func (s *Statistics) printTiming() {
-	fmt.Println("⏱  TIMING")
-	fmt.Printf("   Fetch bookmarks:    %.3fs\n", s.FetchBookmarksDuration.Seconds())
+func (s *Statistics) printTiming(w io.Writer) {
+	fmt.Fprintln(w, "⏱  TIMING")
+	fmt.Fprintf(w, "   Fetch bookmarks:    %.3fs\n", s.FetchBookmarksDuration.Seconds())
 	avgProcessing := 0.0
 	if s.TotalBookmarks > 0 {
 		avgProcessing = s.ProcessingDuration.Seconds() / float64(s.TotalBookmarks)
 	}
-	fmt.Printf("   Process bookmarks:  %.3fs (avg %.3fs per bookmark)\n",
+	fmt.Fprintf(w, "   Process bookmarks:  %.3fs (avg %.3fs per bookmark)\n",
 		s.ProcessingDuration.Seconds(), avgProcessing)
-	fmt.Printf("   Apply changes:      %.3fs\n", s.ApplicationDuration.Seconds())
-	fmt.Printf("   Total duration:     %.3fs\n", s.TotalDuration.Seconds())
-	fmt.Println()
+	fmt.Fprintf(w, "   Apply changes:      %.3fs\n", s.ApplicationDuration.Seconds())
+	fmt.Fprintf(w, "   Total duration:     %.3fs\n", s.TotalDuration.Seconds())
+	fmt.Fprintln(w)
 }
 
-func (s *Statistics) printActions() {
-	fmt.Println("📊 ACTIONS")
-	fmt.Printf("   Total bookmarks:    %d\n", s.TotalBookmarks)
+func (s *Statistics) printActions(w io.Writer) {
+	fmt.Fprintln(w, "📊 ACTIONS")
+	fmt.Fprintf(w, "   Total bookmarks:    %d\n", s.TotalBookmarks)
 	noChangePercent := 0.0
 	updatePercent := 0.0
 	deletePercent := 0.0
@@ -245,76 +238,47 @@ func (s *Statistics) printActions() {
 		updatePercent = float64(s.ActionUpdate) / float64(s.TotalBookmarks) * 100
 		deletePercent = float64(s.ActionDelete) / float64(s.TotalBookmarks) * 100
 	}
-	fmt.Printf("   No changes:         %d (%.1f%%)\n", s.ActionNoChange, noChangePercent)
-	fmt.Printf("   Updates:            %d (%.1f%%)\n", s.ActionUpdate, updatePercent)
-	fmt.Printf("   Deletions:          %d (%.1f%%)\n", s.ActionDelete, deletePercent)
+	fmt.Fprintf(w, "   No changes:         %d (%.1f%%)\n", s.ActionNoChange, noChangePercent)
+	fmt.Fprintf(w, "   Updates:            %d (%.1f%%)\n", s.ActionUpdate, updatePercent)
+	fmt.Fprintf(w, "   Deletions:          %d (%.1f%%)\n", s.ActionDelete, deletePercent)
 	if s.Skipped > 0 {
-		fmt.Printf("   %-20s%d\n", "Skipped (unchecked):", s.Skipped)
+		fmt.Fprintf(w, "   %-20s%d\n", "Skipped (unchecked):", s.Skipped)
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 }
 
-func (s *Statistics) printUpdatesBreakdown() {
+func (s *Statistics) printUpdatesBreakdown(w io.Writer) {
 	if s.URLsChanged == 0 && s.TitlesAdded == 0 && s.TagsAdded == 0 {
 		return
 	}
 
-	fmt.Println("📝 UPDATES BREAKDOWN")
+	fmt.Fprintln(w, "📝 UPDATES BREAKDOWN")
 	if s.URLsChanged > 0 {
-		fmt.Printf("   URLs changed:       %d\n", s.URLsChanged)
+		fmt.Fprintf(w, "   URLs changed:       %d\n", s.URLsChanged)
 	}
 	if s.TitlesAdded > 0 {
-		fmt.Printf("   Titles added:       %d\n", s.TitlesAdded)
+		fmt.Fprintf(w, "   Titles added:       %d\n", s.TitlesAdded)
 	}
 	if s.TagsAdded > 0 {
-		fmt.Printf("   Tags added:         %d\n", s.TagsAdded)
+		fmt.Fprintf(w, "   Tags added:         %d\n", s.TagsAdded)
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 }
 
-func (s *Statistics) printURLProcessing() {
-	totalExpanded := 0
-	for _, count := range s.ShortURLsExpanded {
-		totalExpanded += count
-	}
-	totalFailed := 0
-	for _, count := range s.ShortURLsFailed {
-		totalFailed += count
-	}
-
-	if totalExpanded == 0 && totalFailed == 0 && s.ParenthesesFixed == 0 && s.Redirects == 0 {
+func (s *Statistics) printURLProcessing(w io.Writer) {
+	if s.ParenthesesFixed == 0 && s.Redirects == 0 {
 		return
 	}
 
-	fmt.Println("🔗 URL PROCESSING")
-	s.printShortenerStats(totalExpanded, totalFailed)
+	fmt.Fprintln(w, "🔗 URL PROCESSING")
 
 	if s.ParenthesesFixed > 0 {
-		fmt.Printf("   Parentheses fixed:  %d\n", s.ParenthesesFixed)
+		fmt.Fprintf(w, "   Parentheses fixed:  %d\n", s.ParenthesesFixed)
 	}
 	if s.Redirects > 0 {
-		fmt.Printf("   Redirects followed: %d\n", s.Redirects)
+		fmt.Fprintf(w, "   Redirects followed: %d\n", s.Redirects)
 	}
-	fmt.Println()
-}
-
-func (s *Statistics) printShortenerStats(totalExpanded, totalFailed int) {
-	if totalExpanded == 0 && totalFailed == 0 {
-		return
-	}
-
-	fmt.Println("   Short URLs expanded:")
-
-	// Driven by the same list expandURL dispatches on, so a new shortener
-	// cannot be added to the dispatch and forgotten in the report.
-	for _, service := range shortenerServices {
-		expanded, failed := s.ShortURLsExpanded[service.key], s.ShortURLsFailed[service.key]
-		if expanded == 0 && failed == 0 {
-			continue
-		}
-		fmt.Printf("     • %-16s%d success, %d failed\n",
-			service.display+":", expanded, failed)
-	}
+	fmt.Fprintln(w)
 }
 
 // printHTTPResponses renders the per-operation status breakdown.
@@ -322,19 +286,19 @@ func (s *Statistics) printShortenerStats(totalExpanded, totalFailed int) {
 // Operations and status codes are sorted before printing: ranging a map
 // directly randomizes the order, so two runs over an unchanged account produced
 // textually different reports that could not be diffed.
-func (s *Statistics) printHTTPResponses() {
+func (s *Statistics) printHTTPResponses(w io.Writer) {
 	if len(s.StatusCodes) == 0 {
 		return
 	}
 
-	fmt.Println("🌐 HTTP RESPONSES")
+	fmt.Fprintln(w, "🌐 HTTP RESPONSES")
 	for _, operation := range slices.Sorted(maps.Keys(s.StatusCodes)) {
-		s.printHTTPOperation(operation, s.StatusCodes[operation])
+		printHTTPOperation(w, operation, s.StatusCodes[operation])
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 }
 
-func (s *Statistics) printHTTPOperation(operation string, codes map[int]int) {
+func printHTTPOperation(w io.Writer, operation string, codes map[int]int) {
 	operationName := operation
 	switch operation {
 	case opURLValidation:
@@ -345,18 +309,18 @@ func (s *Statistics) printHTTPOperation(operation string, codes map[int]int) {
 		operationName = "Tag Fetch"
 	}
 
-	fmt.Printf("   %s:\n", operationName)
+	fmt.Fprintf(w, "   %s:\n", operationName)
 
 	for _, statusCode := range slices.Sorted(maps.Keys(codes)) {
 		statusText := http.StatusText(statusCode)
 		if statusText == "" {
 			statusText = "Unknown"
 		}
-		fmt.Printf("     • %d %s: %d\n", statusCode, statusText, codes[statusCode])
+		fmt.Fprintf(w, "     • %d %s: %d\n", statusCode, statusText, codes[statusCode])
 	}
 }
 
-func (s *Statistics) printAPIOperations() {
+func (s *Statistics) printAPIOperations(w io.Writer) {
 	if s.TitlesFetched == 0 && s.TagsFetched == 0 &&
 		s.UpdatesPerformed == 0 && s.DeletionsPerformed == 0 &&
 		s.TitlesFailed == 0 && s.TagsFailed == 0 && s.ApplyErrors == 0 &&
@@ -364,23 +328,23 @@ func (s *Statistics) printAPIOperations() {
 		return
 	}
 
-	fmt.Println("⚙️  API OPERATIONS")
-	printFetchStats("Titles fetched", s.TitlesFetched, s.TitlesEmpty, s.TitlesFailed)
-	printFetchStats("Tags fetched", s.TagsFetched, s.TagsEmpty, s.TagsFailed)
+	fmt.Fprintln(w, "⚙️  API OPERATIONS")
+	printFetchStats(w, "Titles fetched", s.TitlesFetched, s.TitlesEmpty, s.TitlesFailed)
+	printFetchStats(w, "Tags fetched", s.TagsFetched, s.TagsEmpty, s.TagsFailed)
 
 	if s.UpdatesPerformed > 0 {
-		fmt.Printf("   Updates performed:  %d\n", s.UpdatesPerformed)
+		fmt.Fprintf(w, "   Updates performed:  %d\n", s.UpdatesPerformed)
 	}
 	if s.DeletionsPerformed > 0 {
-		fmt.Printf("   Deletions performed: %d\n", s.DeletionsPerformed)
+		fmt.Fprintf(w, "   Deletions performed: %d\n", s.DeletionsPerformed)
 	}
 	if s.Merged > 0 {
-		fmt.Printf("   %-20s%d\n", "Duplicates merged:", s.Merged)
+		fmt.Fprintf(w, "   %-20s%d\n", "Duplicates merged:", s.Merged)
 	}
 	if s.ApplyErrors > 0 {
-		fmt.Printf("   Writes rejected:    %d\n", s.ApplyErrors)
+		fmt.Fprintf(w, "   Writes rejected:    %d\n", s.ApplyErrors)
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 }
 
 // printFetchStats renders one "N fetched" line with its qualifiers, or nothing
@@ -390,36 +354,39 @@ func (s *Statistics) printAPIOperations() {
 // empty and failed are printed separately because they mean different things:
 // nothing to add is a successful call, a failure is not, and merging them told
 // the reader a healthy run had gone wrong.
-func printFetchStats(label string, fetched, empty, failed int) {
+func printFetchStats(w io.Writer, label string, fetched, empty, failed int) {
 	if fetched == 0 && empty == 0 && failed == 0 {
 		return
 	}
 
-	fmt.Printf("   %-20s%d", label+":", fetched)
+	fmt.Fprintf(w, "   %-20s%d", label+":", fetched)
 	if empty > 0 {
-		fmt.Printf(" (%d with nothing to add)", empty)
+		fmt.Fprintf(w, " (%d with nothing to add)", empty)
 	}
 	if failed > 0 {
-		fmt.Printf(" (%d failed)", failed)
+		fmt.Fprintf(w, " (%d failed)", failed)
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 }
 
-func (s *Statistics) Print() {
+// Print renders the report to w. It takes the writer rather than printing to
+// stdout so a test reads the report from a buffer instead of swapping the
+// process-wide os.Stdout, which kept every report test out of t.Parallel.
+func (s *Statistics) Print(w io.Writer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fmt.Println("════════════════════════════════════════════════════════")
-	fmt.Println("                   PROCESSING STATISTICS")
-	fmt.Println("════════════════════════════════════════════════════════")
-	fmt.Println()
+	fmt.Fprintln(w, "════════════════════════════════════════════════════════")
+	fmt.Fprintln(w, "                   PROCESSING STATISTICS")
+	fmt.Fprintln(w, "════════════════════════════════════════════════════════")
+	fmt.Fprintln(w)
 
-	s.printTiming()
-	s.printActions()
-	s.printUpdatesBreakdown()
-	s.printURLProcessing()
-	s.printHTTPResponses()
-	s.printAPIOperations()
+	s.printTiming(w)
+	s.printActions(w)
+	s.printUpdatesBreakdown(w)
+	s.printURLProcessing(w)
+	s.printHTTPResponses(w)
+	s.printAPIOperations(w)
 
-	fmt.Println("════════════════════════════════════════════════════════")
+	fmt.Fprintln(w, "════════════════════════════════════════════════════════")
 }

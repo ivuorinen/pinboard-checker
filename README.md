@@ -2,7 +2,7 @@
 
 A Go tool to check and maintain your [Pinboard](https://pinboard.in) bookmarks by:
 - Expanding shortened URLs (bit.ly, tinyurl.com, is.gd)
-- Following redirects to final destinations
+- Following permanent redirects to their destinations
 - Fixing URLs with trailing parentheses
 - Detecting and removing dead links
 - Fetching and setting missing bookmark titles
@@ -13,18 +13,23 @@ A Go tool to check and maintain your [Pinboard](https://pinboard.in) bookmarks b
 
 - **Parallel Processing**: Processes bookmarks concurrently (configurable, default 10 workers)
 - **Rate Limiting**: Respects Pinboard API rate limits (1 request per 3 seconds)
-- **URL Shortener Support**: Expands tinyurl.com and is.gd URLs, and bit.ly when
-  `BITLY_ACCESS_TOKEN` is set. An unexpandable short link is left as-is, never deleted
+- **URL Shortener Support**: bit.ly, tinyurl.com, is.gd, and any other shortener
+  answer with a 301 to the destination, which is followed like every permanent
+  redirect. A short link whose destination is gone (404 or 410) is deleted like any
+  other dead link
 - **Dead Link Detection**: Deletes bookmarks only on 404 or 410 — the two answers that
   report the resource itself gone. Every other status, timeouts, DNS failures, and
-  non-HTTP schemes are skipped, never deleted
+  non-HTTP schemes are skipped, never deleted. A 404 from github.com is skipped too:
+  GitHub answers 404 for a private repository rather than confirm it exists
 - **URL Normalization**: Fixes common URL issues like trailing parentheses
 - **Auto-Title Fetching**: Automatically fetches and sets page titles for bookmarks without them
 - **Auto-Tagging**: Adds up to 9 suggested tags (from Pinboard API) plus an
   `.autoTagged` marker to untagged bookmarks, 10 in total. Pinboard treats tags
   beginning with a period as private tags
 - **Dry Run Mode**: Test changes without modifying bookmarks
-- **Progress Tracking**: Shows progress bar for batch operations
+- **Progress Tracking**: Shows a progress bar for batch operations; under `-verbose`,
+  whose per-bookmark lines would land on the bar, a progress line every 15 seconds
+  instead
 - **CI Mode**: Quiet mode for automated environments
 
 ## Installation
@@ -58,15 +63,18 @@ https://pinboard.in/settings/password
 
 ### Environment Variable
 
-Create a `.env` file:
+Create a `.env` file in the directory you run the tool from:
 
 ```bash
 PINBOARD_API_TOKEN=username:XXXXXXXXXXXXXXXXXXXX
-
-# Optional: without it, bit.ly links are left unexpanded (never deleted),
-# because Bitly's expand API rejects unauthenticated requests.
-BITLY_ACCESS_TOKEN=
 ```
+
+Only `PINBOARD_API_TOKEN` is read from it, and nothing in it is exported to the
+environment. The line may use `export`, single or double quotes, and a trailing
+` # comment`; `#` lines and blank lines are skipped. Variable expansion (`${VAR}`)
+and multi-line values are not supported. A line without `=` stops the run with
+its line number. `-token` takes precedence over the environment, and the
+environment over `.env`.
 
 Or set it in your shell:
 
@@ -108,7 +116,9 @@ Pinboard's API requires authentication tokens to be passed as URL query paramete
 
 This tool treats errors differently based on their type:
 
-- **404 and 410**: the server reports the resource itself gone → Bookmark deleted
+- **404 and 410**: the server reports the resource itself gone → Bookmark deleted.
+  The exception is github.com, which answers 404 to an unauthenticated request for a
+  private repository → Bookmark kept and counted as skipped
 - **Every other 4xx (401, 403, 408, 429, 451, …)**: the server refused *the request*,
   not the resource → Bookmark kept and counted as skipped
 - **5xx errors (500, 503, etc.)**: Temporary server errors → Bookmark kept
@@ -138,7 +148,7 @@ pinboard-checker -dry-run
 # Verbose output
 pinboard-checker -verbose
 
-# CI mode (no progress bar, minimal output)
+# CI mode (no progress bars; one count line instead of the summary)
 pinboard-checker -ci
 ```
 
@@ -146,8 +156,11 @@ pinboard-checker -ci
 
 - `-token string`: Pinboard API token (default: reads from `PINBOARD_API_TOKEN` env var)
 - `-dry-run`: Run without making changes (default: false)
-- `-verbose`: Enable verbose logging (default: false)
-- `-ci`: CI mode - no progress bar or verbose output (default: false)
+- `-verbose`: Enable verbose logging. The progress bar becomes a line such as
+  `Processing bookmarks... 42/100 (42%), 1m3s elapsed, 1m27s left`, printed every
+  15 seconds (default: false)
+- `-ci`: CI mode - no progress bars, and the summary becomes one count line on stderr;
+  `-verbose` still prints its narration when both are given (default: false)
 - `-skip-titles`: Skip fetching titles for bookmarks without them (default: false)
 - `-skip-auto-tags`: Skip auto-tagging bookmarks without tags (default: false)
 - `-workers int`: Number of concurrent workers (default: 10, allowed range: 1-100)
@@ -162,13 +175,20 @@ pinboard-checker -ci
 2. **Process Each Bookmark**:
    - Skips anything `net/http` cannot dial (`mailto:`, `ftp:`, `file:`,
      `javascript:` bookmarklets) without touching it
-   - Expands shortened URLs (bit.ly, tinyurl.com, is.gd)
-   - Fixes a trailing parenthesis when the URL works without it
-   - Follows the redirect chain to its final destination (up to 5 hops)
+   - Short links (bit.ly, tinyurl.com, is.gd) need no step of their own: they answer
+     with a 301, which the redirect walk below follows
+   - Fixes an unbalanced trailing parenthesis when the URL works without it; a
+     balanced one, as in `/wiki/Mercury_(planet)`, belongs to the URL and is kept
+   - Follows the redirect chain (up to 5 hops). Only permanent redirects (301, 308)
+     are written back; a 302, 303 or 307 is followed for the check but the bookmark
+     keeps its URL, because a login wall answers an anonymous request with exactly
+     that
    - Checks the **final** URL, and only it: a 404 or 410 marks the bookmark dead,
      anything else keeps it. The repairs above run first on purpose — their whole
      point is to turn a URL that fails right now into one that works
-   - Fetches page title if bookmark has no title (unless `-skip-titles`)
+   - Fetches page title if bookmark has no title (unless `-skip-titles`). The title
+     comes from the bookmark's own URL: a page that answers with a redirect, as a
+     login wall does, gives no title rather than the login page's
    - Fetches suggested tags if bookmark has no tags (unless `-skip-auto-tags`)
      - Gets up to 9 tags from Pinboard's suggestion API, plus the `.autoTagged`
        marker, for 10 in total
@@ -201,8 +221,24 @@ pinboard-checker -ci
 ```
 
 Exits non-zero when the bookmark fetch fails or when any change could not be
-applied, so a broken scheduled run does not report success. Failure counts are
-printed even under `-ci`.
+applied, so a broken scheduled run does not report success. Under `-ci` the summary
+is replaced by one count line on stderr (`updated N, deleted N, merged N, skipped
+N, rejected N`), and failure counts are printed as well.
+
+### Deletion records
+
+Pinboard has no trash, so every deletion — a dead link, a merged duplicate, or the
+old entry of a moved bookmark — prints one line on stderr at every verbosity,
+`-ci` included:
+
+```text
+deleted (dead link): description=...&dt=...&extended=...&replace=yes&tags=...&url=...
+```
+
+The part after the colon is the `posts/add` query that recreates the bookmark —
+URL, title, notes, tags, date, and privacy — so a wrongful deletion can be undone
+by sending it back to `https://api.pinboard.in/v1/posts/add` with your token. It
+carries the bookmark's private fields, so keep logs that capture stderr private.
 
 ### Skip fetching missing titles
 
@@ -219,7 +255,7 @@ pinboard-checker -skip-auto-tags
 ## Statistics
 
 Every run except `-ci` prints a summary: timings, the action breakdown, what
-changed, HTTP status counts per operation, and the API calls performed. Two
+changed, HTTP status counts per operation, and the API calls performed. Three
 counters are worth knowing:
 
 - **Skipped (unchecked)** — bookmarks left untouched because they could not be
@@ -265,12 +301,12 @@ block is excluded with a marker placed inside it:
 
 ```go
 if err != nil {
-    // coverage:ignore json.Marshal cannot fail for a map[string]string
-    return "", fmt.Errorf("failed to encode bit.ly request: %w", err)
+    // coverage:ignore <why this branch cannot execute>
+    return "", fmt.Errorf("...: %w", err)
 }
 ```
 
-There is exactly one of these today. It is for code that *cannot* run, never for
+There are none today. A marker is for code that *cannot* run, never for
 code that is merely awkward to reach — treat a new one as a claim to verify.
 `scripts/coverage-gate.sh` implements the rule and reports what it excluded.
 
@@ -306,7 +342,9 @@ Separately from the Pinboard budget, requests to any single bookmarked host are
 spaced 500ms apart. Without this, an account with many bookmarks on one domain
 had its workers send them all at once, and the domain answered 429 or 403 — an
 answer the tool provoked itself. Different hosts are never throttled against
-each other, so the pool still runs at full width. Every request also carries a
+each other, and bookmarks are dealt to the workers round-robin across hosts, so a
+run of bookmarks on one domain does not park the whole pool on that domain's
+schedule. Every request also carries a
 `User-Agent` naming the tool and this repository, so a host that does throttle
 can see what is calling it.
 

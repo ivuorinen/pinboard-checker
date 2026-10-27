@@ -19,44 +19,65 @@ import (
 //nolint:gosec // fake value, used only to assert it never reaches an error string
 const leakToken = "ivuorinen:SUPERSECRETTOKENVALUE"
 
-//nolint:paralleltest // drives the package-level stats, endpoint, and mode flags
+// newRunChecker returns a test checker for a whole pass against a Pinboard
+// fixture: -ci and both lookups off, so a test asserts the run's contract
+// rather than the bookmark processing it contains.
+func newRunChecker(t *testing.T, endpoint string) *checker {
+	t.Helper()
+
+	chk := newTestChecker(t)
+	chk.pinboardEndpoint = endpoint
+	chk.ciMode = true
+	chk.skipTitles = true
+	chk.skipAutoTags = true
+	chk.workers = 1
+
+	return chk
+}
+
 func TestRun_CleanPassExitsZero(t *testing.T) {
-	resetStats(t)
-	setCIMode(t, true)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, `[]`)
-	useEndpoint(t, server.URL)
-
-	if code := run(testToken, 1, false); code != 0 {
+	if code := newRunChecker(t, staticServer(t, http.StatusOK, `[]`).URL).run(); code != 0 {
 		t.Errorf("run() = %d, want 0 for a clean pass", code)
+	}
+}
+
+// -ci drops the report but not the outcome. A -ci run that deleted bookmarks
+// and failed nothing used to print nothing at all; the count line is printed on
+// every -ci run, clean ones included.
+func TestRun_CIModePrintsCountLine(t *testing.T) {
+	t.Parallel()
+
+	chk := newRunChecker(t, staticServer(t, http.StatusOK, `[]`).URL)
+
+	if code := chk.run(); code != 0 {
+		t.Errorf("run() = %d, want 0", code)
+	}
+
+	want := "updated 0, deleted 0, merged 0, skipped 0, rejected 0"
+	if output := stderrOf(chk); !strings.Contains(output, want) {
+		t.Errorf("stderr = %q, want the -ci count line %q", output, want)
 	}
 }
 
 // Returning from main exited 0, which let a scheduled run report success after
 // fetching nothing.
-//
-//nolint:paralleltest // drives the package-level stats, endpoint, and mode flags
 func TestRun_FetchFailureExitsNonZero(t *testing.T) {
-	resetStats(t)
-	setCIMode(t, true)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusUnauthorized, "API requires authentication")
-	useEndpoint(t, server.URL)
+	chk := newRunChecker(t,
+		staticServer(t, http.StatusUnauthorized, "API requires authentication").URL)
 
-	if code := run(testToken, 1, false); code != 1 {
+	if code := chk.run(); code != 1 {
 		t.Errorf("run() = %d, want 1 when the fetch fails", code)
 	}
 }
 
 // A run that applies nothing because every write was rejected must not look
 // clean: the counters are what distinguish it from a no-op pass.
-//
-//nolint:paralleltest // drives the package-level stats, endpoint, and mode flags
 func TestRun_RejectedWriteExitsNonZero(t *testing.T) {
-	resetStats(t)
-	setCIMode(t, true)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
 	// The bookmark has no title and its page supplies one, so processBookmark
 	// schedules an update; posts/add then rejects it in-band at HTTP 200.
@@ -74,14 +95,14 @@ func TestRun_RejectedWriteExitsNonZero(t *testing.T) {
 
 		writeBody(t, w, `{"result_code":"something went wrong"}`)
 	})
-	useEndpoint(t, server.URL)
 
-	setSkipFlags(t, false, true)
+	chk := newRunChecker(t, server.URL)
+	chk.skipTitles = false
 
-	code := run(testToken, 1, false)
+	code := chk.run()
 
-	if stats.ApplyErrorCount() != 1 {
-		t.Fatalf("ApplyErrorCount() = %d, want 1", stats.ApplyErrorCount())
+	if chk.stats.ApplyErrorCount() != 1 {
+		t.Fatalf("ApplyErrorCount() = %d, want 1", chk.stats.ApplyErrorCount())
 	}
 	if code != 1 {
 		t.Errorf("run() = %d, want 1 when a write is rejected", code)
@@ -90,32 +111,23 @@ func TestRun_RejectedWriteExitsNonZero(t *testing.T) {
 
 // Without -ci the run prints its statistics block, which is the only report the
 // tool produces.
-//
-//nolint:paralleltest // drives the package-level stats, endpoint, and mode flags
 func TestRun_PrintsStatisticsWhenNotCIMode(t *testing.T) {
-	resetStats(t)
-	setCIMode(t, false)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, `[]`)
-	useEndpoint(t, server.URL)
+	chk := newRunChecker(t, staticServer(t, http.StatusOK, `[]`).URL)
+	chk.ciMode = false
 
-	output := captureOutput(func() {
-		if code := run(testToken, 1, false); code != 0 {
-			t.Errorf("run() = %d, want 0", code)
-		}
-	})
+	if code := chk.run(); code != 0 {
+		t.Errorf("run() = %d, want 0", code)
+	}
 
-	if !strings.Contains(output, "PROCESSING STATISTICS") {
+	if output := stdoutOf(chk); !strings.Contains(output, "PROCESSING STATISTICS") {
 		t.Errorf("output = %q, want the statistics block", output)
 	}
 }
 
-//nolint:paralleltest // drives the package-level stats, endpoint, and mode flags
 func TestRun_DryRunIssuesNoWrites(t *testing.T) {
-	resetStats(t)
-	setCIMode(t, true)
-	setSkipFlags(t, true, true)
+	t.Parallel()
 
 	target := staticServer(t, http.StatusNotFound, "")
 
@@ -128,11 +140,13 @@ func TestRun_DryRunIssuesNoWrites(t *testing.T) {
 			return
 		}
 
-		writeBody(t, w, `{"result_code":"done"}`)
+		writeBody(t, w, testDoneBody)
 	})
-	useEndpoint(t, server.URL)
 
-	if code := run(testToken, 1, true); code != 0 {
+	chk := newRunChecker(t, server.URL)
+	chk.dryRun = true
+
+	if code := chk.run(); code != 0 {
 		t.Errorf("run() = %d, want 0 for a dry run", code)
 	}
 
@@ -144,39 +158,44 @@ func TestRun_DryRunIssuesNoWrites(t *testing.T) {
 	}
 }
 
-// Both clients must be updated. Dropping the second assignment is an easy
-// refactor slip and would leave the redirect probe unbounded.
-//
-//nolint:paralleltest // mutates the shared HTTP clients
+// Both clients must be rebuilt. Dropping the second is an easy refactor slip
+// and would leave the redirect probe unbounded.
 func TestSetHTTPTimeout(t *testing.T) {
-	swap(t, &httpClient.Timeout, httpClient.Timeout)
-	swap(t, &redirectClient.Timeout, redirectClient.Timeout)
+	t.Parallel()
 
-	setHTTPTimeout(7 * time.Second)
+	chk := newTestChecker(t)
+	chk.setHTTPTimeout(7 * time.Second)
 
-	if httpClient.Timeout != 7*time.Second {
-		t.Errorf("httpClient.Timeout = %s, want 7s", httpClient.Timeout)
+	if chk.client.Timeout != 7*time.Second {
+		t.Errorf("client.Timeout = %s, want 7s", chk.client.Timeout)
 	}
-	if redirectClient.Timeout != 7*time.Second {
-		t.Errorf("redirectClient.Timeout = %s, want 7s", redirectClient.Timeout)
+	if chk.redirectClient.Timeout != 7*time.Second {
+		t.Errorf("redirectClient.Timeout = %s, want 7s", chk.redirectClient.Timeout)
 	}
 }
 
-// The auth token travels in the query string, and url.Error renders the full
-// URL, so wrapping a transport failure printed the credential to stderr.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
-func TestPinboardGet_TransportErrorHidesToken(t *testing.T) {
-	resetStats(t)
+// closedEndpoint returns the URL of a server that is already closed, which
+// gives a guaranteed dial failure.
+func closedEndpoint(t *testing.T) string {
+	t.Helper()
 
-	// A server closed immediately gives a guaranteed dial failure.
 	server := staticServer(t, http.StatusOK, "")
 	endpoint := server.URL
 	server.Close()
 
-	useEndpoint(t, endpoint)
+	return endpoint
+}
 
-	_, err := getBookmarks(leakToken)
+// The auth token travels in the query string, and url.Error renders the full
+// URL, so wrapping a transport failure printed the credential to stderr.
+func TestPinboardGet_TransportErrorHidesToken(t *testing.T) {
+	t.Parallel()
+
+	chk := newTestChecker(t)
+	chk.apiToken = leakToken
+	chk.pinboardEndpoint = closedEndpoint(t)
+
+	_, err := chk.getBookmarks()
 	if err == nil {
 		t.Fatal("getBookmarks() error = nil, want a transport error")
 	}
@@ -190,17 +209,14 @@ func TestPinboardGet_TransportErrorHidesToken(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestUpdateBookmark_TransportErrorHidesToken(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, "")
-	endpoint := server.URL
-	server.Close()
+	chk := newTestChecker(t)
+	chk.apiToken = leakToken
+	chk.pinboardEndpoint = closedEndpoint(t)
 
-	useEndpoint(t, endpoint)
-
-	err := updateBookmark(leakToken, Bookmark{URL: testURL}, testURL, testTitle, "")
+	err := chk.updateBookmark(Bookmark{URL: testURL}, testURL, testTitle, "")
 	if err == nil {
 		t.Fatal("updateBookmark() error = nil, want a transport error")
 	}
@@ -211,17 +227,16 @@ func TestUpdateBookmark_TransportErrorHidesToken(t *testing.T) {
 
 // pinboardGet must not write the credential into the caller's map, which the
 // caller may later log as ordinary request parameters.
-//
-//nolint:paralleltest // repoints pinboardAPIEndpoint
 func TestPinboardGet_DoesNotMutateCallerParams(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
-	server := staticServer(t, http.StatusOK, `{"result_code":"done"}`)
-	useEndpoint(t, server.URL)
+	chk := newTestChecker(t)
+	chk.apiToken = leakToken
+	chk.pinboardEndpoint = staticServer(t, http.StatusOK, testDoneBody).URL
 
 	params := url.Values{paramURL: {testURL}}
 
-	if err := pinboardWrite("/posts/delete", params, leakToken); err != nil {
+	if err := chk.pinboardWrite("/posts/delete", params); err != nil {
 		t.Fatalf("pinboardWrite() error = %v, want nil", err)
 	}
 
@@ -236,65 +251,108 @@ func TestPinboardGet_DoesNotMutateCallerParams(t *testing.T) {
 // One transient 429 must not slow the rest of the run. The interval widens on
 // rejection and must come back down once requests succeed; without the narrowing
 // a momentary throttle left the widened interval in place for the whole run.
-//
-// Driven at production scale rather than through the network, because
-// narrowRateLimit floors at defaultRateLimit and a millisecond-scale fixture
-// would sit below the floor and never move.
-//
-//nolint:paralleltest // drives the package-level rate limiter
 func TestRateLimit_WidensOn429AndNarrowsOnSuccess(t *testing.T) {
-	swap(t, &rateLimitInterval, defaultRateLimit)
+	t.Parallel()
 
-	// The ticker is left at the suite-wide 1ms so later tests stay fast.
-	t.Cleanup(func() { rateLimiter.Reset(time.Millisecond) })
+	limiter := newRateLimiter(defaultRateLimit)
 
-	if got := widenRateLimit(); got != 2*defaultRateLimit {
-		t.Fatalf("widenRateLimit() = %s, want %s", got, 2*defaultRateLimit)
+	if got := limiter.widen(); got != 2*defaultRateLimit {
+		t.Fatalf("widen() = %s, want %s", got, 2*defaultRateLimit)
 	}
-	if got := widenRateLimit(); got != 4*defaultRateLimit {
-		t.Fatalf("second widenRateLimit() = %s, want %s", got, 4*defaultRateLimit)
-	}
-
-	narrowRateLimit()
-
-	if rateLimitInterval != 2*defaultRateLimit {
-		t.Errorf("after narrowing, interval = %s, want %s",
-			rateLimitInterval, 2*defaultRateLimit)
+	if got := limiter.widen(); got != 4*defaultRateLimit {
+		t.Fatalf("second widen() = %s, want %s", got, 4*defaultRateLimit)
 	}
 
-	narrowRateLimit()
+	limiter.narrow()
 
-	if rateLimitInterval != defaultRateLimit {
-		t.Errorf("after narrowing, interval = %s, want the default %s",
-			rateLimitInterval, defaultRateLimit)
+	if got := limiter.interval; got != 2*defaultRateLimit {
+		t.Errorf("after narrowing, interval = %s, want %s", got, 2*defaultRateLimit)
+	}
+
+	limiter.narrow()
+
+	if got := limiter.interval; got != defaultRateLimit {
+		t.Errorf("after narrowing, interval = %s, want the default %s", got, defaultRateLimit)
 	}
 
 	// The floor holds: narrowing further must not drop below the documented rate.
-	narrowRateLimit()
+	limiter.narrow()
 
-	if rateLimitInterval != defaultRateLimit {
-		t.Errorf("interval = %s, want it floored at %s", rateLimitInterval, defaultRateLimit)
+	if got := limiter.interval; got != defaultRateLimit {
+		t.Errorf("interval = %s, want it floored at %s", got, defaultRateLimit)
 	}
 }
 
-//nolint:paralleltest // drives the package-level rate limiter
-func TestWidenRateLimit_ClampsAtMax(t *testing.T) {
-	swap(t, &rateLimitInterval, maxRateLimit)
+func TestRateLimiter_WidenClampsAtMax(t *testing.T) {
+	t.Parallel()
 
-	t.Cleanup(func() { rateLimiter.Reset(time.Millisecond) })
-
-	if got := widenRateLimit(); got != maxRateLimit {
-		t.Errorf("widenRateLimit() = %s, want it clamped at %s", got, maxRateLimit)
+	if got := newRateLimiter(maxRateLimit).widen(); got != maxRateLimit {
+		t.Errorf("widen() = %s, want it clamped at %s", got, maxRateLimit)
 	}
 }
 
-// closeBody's failure branch routes to stderr rather than stdout, so a close
-// diagnostic cannot interleave with the statistics report.
+// The first call of a run goes at once. The ticker the limiter used to be
+// delivered its first tick a whole interval after construction, so every run
+// waited 3 s before fetching a single bookmark.
+func TestRateLimiter_FirstCallDoesNotWait(t *testing.T) {
+	t.Parallel()
+
+	limiter := newRateLimiter(time.Hour)
+
+	done := make(chan struct{})
+	go func() {
+		limiter.wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first wait() blocked, want it to return at once")
+	}
+}
+
+// Every call after the first starts a full interval after the one before it,
+// and a widened interval holds the retry back by the new value. Each clock
+// starts before the slot is booked, so the bound holds to the nanosecond.
+func TestRateLimiter_SpacesCallsByTheInterval(t *testing.T) {
+	t.Parallel()
+
+	const interval = 50 * time.Millisecond
+
+	limiter := newRateLimiter(interval)
+
+	start := time.Now()
+	limiter.wait()
+	limiter.wait()
+
+	if elapsed := time.Since(start); elapsed < interval {
+		t.Errorf("two wait() calls took %s, want at least %s", elapsed, interval)
+	}
+
+	start = time.Now()
+	widened := limiter.widen()
+	limiter.wait()
+
+	if elapsed := time.Since(start); elapsed < widened {
+		t.Errorf("wait() after widen returned after %s, want at least %s", elapsed, widened)
+	}
+}
+
+// closeBody's failure branch routes to the diagnostic stream rather than the
+// report stream, so a close diagnostic cannot interleave with the statistics.
 func TestCloseBody_ReportsFailure(t *testing.T) {
 	t.Parallel()
 
-	// Closing twice makes the second Close return an error deterministically.
-	closeBody(errCloser{})
+	chk := newTestChecker(t)
+	chk.closeBody(errCloser{})
+
+	if output := stderrOf(chk); !strings.Contains(output, "close failed") {
+		t.Errorf("stderr = %q, want the close failure", output)
+	}
+	if output := stdoutOf(chk); output != "" {
+		t.Errorf("stdout = %q, want nothing on the report stream", output)
+	}
 }
 
 // errCloser always fails to close, standing in for a body whose underlying
@@ -305,22 +363,26 @@ func (errCloser) Close() error { return errors.New("close failed") }
 
 // reportApplyError prints only when -verbose is set; the counter is the
 // caller's responsibility and must not depend on the flag.
-//
-//nolint:paralleltest // mutates the verbose flag
 func TestReportApplyError_HonoursVerbose(t *testing.T) {
-	setVerbose(t, true)
-	reportApplyError("updating", testURL, errors.New("boom"))
+	t.Parallel()
 
-	setVerbose(t, false)
-	reportApplyError("updating", testURL, errors.New("boom"))
+	for _, verbose := range []bool{true, false} {
+		chk := newTestChecker(t)
+		chk.verbose = verbose
+		chk.reportApplyError("updating", testURL, errors.New("boom"))
+
+		output := stderrOf(chk)
+		if printed := strings.Contains(output, "Error updating "+testURL); printed != verbose {
+			t.Errorf("verbose %v: stderr = %q, want the error printed only under -verbose",
+				verbose, output)
+		}
+	}
 }
 
 // A parenthesis fix is already validated by fixParenthesesSuffix, so the
 // pipeline must not request the same URL a second time.
-//
-//nolint:paralleltest // writes to the stats singleton
 func TestExpandAndCheckURL_ParenthesisFixIsNotRevalidated(t *testing.T) {
-	resetStats(t)
+	t.Parallel()
 
 	trimmed := ""
 	rec := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +395,7 @@ func TestExpandAndCheckURL_ParenthesisFixIsNotRevalidated(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	got, err := expandAndCheckURL(rec.URL+"/page)", false)
+	got, err := newTestChecker(t).expandAndCheckURL(rec.URL + "/page)")
 	if err != nil {
 		t.Fatalf("expandAndCheckURL() error = %v, want nil", err)
 	}
@@ -359,18 +421,13 @@ func TestExpandAndCheckURL_ParenthesisFixIsNotRevalidated(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // repoints pinboardAPIEndpoint and drives the rate limiter
 func TestPinboardGet_GivesUpAfterRetries(t *testing.T) {
-	resetStats(t)
-	swap(t, &rateLimitInterval, time.Nanosecond)
+	t.Parallel()
 
-	t.Cleanup(func() { rateLimiter.Reset(time.Millisecond) })
+	chk := newTestChecker(t)
+	chk.pinboardEndpoint = staticServer(t, http.StatusTooManyRequests, "").URL
 
-	server := staticServer(t, http.StatusTooManyRequests, "")
-	useEndpoint(t, server.URL)
-
-	_, err := getBookmarks(testToken)
-	if !errors.Is(err, errRateLimited) {
+	if _, err := chk.getBookmarks(); !errors.Is(err, errRateLimited) {
 		t.Errorf("getBookmarks() error = %v, want errRateLimited", err)
 	}
 }
@@ -384,38 +441,5 @@ func TestTargetURL(t *testing.T) {
 	}
 	if got := targetURL(testURL, testNewURL); got != testNewURL {
 		t.Errorf("targetURL() = %q, want the rewritten URL", got)
-	}
-}
-
-func TestShortenerFor(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		cleaned string
-		wantKey string
-	}{
-		{name: "bitly", cleaned: "bit.ly/abc", wantKey: svcBitly},
-		{name: "tinyurl", cleaned: "tinyurl.com/abc", wantKey: svcTinyURL},
-		{name: "isgd", cleaned: "is.gd/abc", wantKey: svcIsGd},
-		{name: "unknown host", cleaned: "example.com/abc", wantKey: ""},
-		// A lookalike host must not match the bit.ly prefix.
-		{name: "lookalike host", cleaned: "bit.ly.example.com/abc", wantKey: ""},
-	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			service, found := shortenerFor(testCase.cleaned)
-			if found != (testCase.wantKey != "") {
-				t.Fatalf("shortenerFor(%q) found = %v, want %v",
-					testCase.cleaned, found, testCase.wantKey != "")
-			}
-			if found && service.key != testCase.wantKey {
-				t.Errorf("shortenerFor(%q) key = %q, want %q",
-					testCase.cleaned, service.key, testCase.wantKey)
-			}
-		})
 	}
 }
