@@ -1,41 +1,82 @@
-# Tool versions for this repository.
+# Tools and tasks for this repository. CI installs the same tools with
+# jdx/mise-action, runs the build, coverage and check tasks, and lints with
+# golangci-lint-action on the same golangci-lint (without auto-fix).
 #
-# Every tool the repo actually invokes -- from the Justfile, .goreleaser.yml and
-# .github/workflows/ -- pinned so a local run matches CI. When a version here
-# mirrors a pin elsewhere in the repo, the comment says where; bump both or the
-# two will silently disagree.
-#
-# Tasks live in the Justfile (`just --list`), not here.
+# Go is not pinned here: mise reads the `toolchain` line in go.mod (see
+# [settings]), the same line Go's own toolchain switching follows, so go.mod is
+# the only place the Go version lives.
 
 [tools]
-
-# --- language toolchain -------------------------------------------------------
-# Must match the `toolchain` line in go.mod -- not the `go` directive, which is
-# the *minimum* language version the code builds against (1.25.0, the floor the
-# golang.org/x deps set). CI resolves the same toolchain via go-version-file.
-go = "1.27.3"
-
-# --- Go static analysis --------------------------------------------------------
-# Matches the version pinned in .github/workflows/go.yml's golangci-lint-action.
 golangci-lint = "2.15.0"
-
-# --- build and release ---------------------------------------------------------
-just = "1.59.0"
-# release.yml pins the action to "~> v2", so any v2 is acceptable.
-# Held at 2.17.0 deliberately: 2.18.0 fails mise's provenance check, because
-# upstream now signs releases as "https://dotcom.releases.github.com" while aqua
-# still expects "goreleaser/goreleaser/.github/workflows/release.yml".
 goreleaser = "2.18.3"
-# goreleaser shells out to these during `just release`: `signs.cmd: cosign` and
-# the `sboms` block (syft). Without them a local snapshot skips or fails those
-# stages, so it would not exercise what CI does.
-# cosign matches the `cosign-release` pinned in .github/workflows/release.yml.
+# goreleaser shells out to these in the release workflow: `signs.cmd: cosign`
+# and the `sboms` block (syft).
 cosign = "2.6.5"
 syft = "1.55.0"
+# The `check` task: the repo's conventions golangci-lint does not cover.
+editorconfig-checker = "4.0.2"
+shellcheck = "0.11.0"
+actionlint = "1.7.12"
+zizmor = "1.31.1"
 
 [settings]
-# Every tool here is pinned explicitly, so mise has no reason to also read a
-# version out of go.mod. Reading it is deprecated anyway (mise removes the
-# go.mod `go` directive as a version source in 2026.11.0): that directive is a
-# minimum compatible version, not the version the project is built with.
-idiomatic_version_file_enable_tools = []
+# Take the Go version from go.mod. mise reads `toolchain goX.Y.Z` as an exact
+# version; only a patch-less `go X.Y` directive is deprecated as a source.
+idiomatic_version_file_enable_tools = ["go"]
+
+[tasks.format]
+description = "Format Go code"
+run = "gofmt -s -w ."
+
+[tasks.lint]
+description = "Lint Go code, applying golangci-lint's auto-fixes"
+run = "golangci-lint run"
+
+# Each of these has let a defect reach the tree before it ran in CI: line-length
+# violations in the workflows, a shellcheck warning in gen-notices.sh (which
+# runs at tag time with the release job's write token), and zizmor findings.
+[tasks.check]
+description = "Check .editorconfig, the shell scripts, and the workflows"
+run = [
+  "editorconfig-checker",
+  "shellcheck scripts/*.sh",
+  "actionlint",
+  "zizmor --pedantic .",
+]
+
+# -race is not optional: the whole program is a worker pool sharing one mutable
+# Statistics, so a race introduced there must fail.
+[tasks.test]
+description = "Run all tests under the race detector"
+run = "go test -race ./..."
+
+# Blocks marked `// coverage:ignore` are excluded; see the script.
+[tasks.coverage]
+description = "Run tests with coverage; fail below 100% and write coverage.html"
+run = [
+  "go test -race -coverprofile=coverage.out ./...",
+  "./scripts/coverage-gate.sh coverage.out 100",
+  "go tool cover -html=coverage.out -o coverage.html",
+]
+
+[tasks.build]
+description = "Build the binary"
+run = "go build -o pinboard-checker ."
+
+# --skip=sign: keyless cosign outside CI opens a browser login and records the
+# signer's email in the public Rekor log, for an artifact nobody downloads.
+[tasks.release]
+description = "Build a snapshot release into dist/ (no publish, no signing)"
+run = "goreleaser release --clean --snapshot --skip=sign"
+
+[tasks.release-publish]
+description = "Publish a release; run by the release workflow (needs GITHUB_TOKEN, OIDC)"
+run = "goreleaser release --clean"
+
+[tasks.tidy]
+description = "Update Go modules"
+run = "go mod tidy"
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "rm -rf pinboard-checker dist/ coverage.out coverage.html THIRD_PARTY_NOTICES.md"

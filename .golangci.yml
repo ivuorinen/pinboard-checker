@@ -1,5 +1,4 @@
-# golangci-lint configuration
-# Version: 2.12.2 (golangci-lint v2)
+# golangci-lint configuration; the golangci-lint version is pinned in mise.toml.
 
 version: "2"
 

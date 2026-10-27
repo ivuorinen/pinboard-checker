@@ -1,6 +1,3 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
 name: Go test build
 
 on:
@@ -15,46 +12,75 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR supersedes the run in progress; runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
 
   build:
+    name: Build and test
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-    - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
       with:
-        # Follow go.mod rather than a second, separately drifting version pin.
-        go-version-file: go.mod
+        persist-credentials: false
+
+    # Installs the tools in mise.toml; Go comes from go.mod's toolchain line. The
+    # default cache key hashes only mise's own files, and an exact hit is never
+    # re-saved, so go.mod joins the key or a toolchain bump is downloaded forever.
+    - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+      with:
+        # mise itself; unset, each run installs the newest release. Renovate
+        # bumps it as the jdx/mise dependency.
+        version: 2026.10.1
+        cache_key: "{{default}}-${{ hashFiles('go.mod') }}"
+
+    # mise-action caches only mise's directory, not Go's build and module caches.
+    # go.mod is in the key for the reason above: a toolchain bump needs a new
+    # key, or the stale cache keeps being restored and is never re-saved.
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('go.mod', 'go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
 
     - name: Build
-      run: go build -v ./...
+      run: mise run build
 
-    # -race is not optional here: the whole program is a worker pool sharing one
-    # mutable Statistics, so a race introduced there must fail the build.
-    - name: Test
-      run: go test -race -coverprofile=coverage.out ./...
-
-    # The suite covers every statement, so a drop means a new branch arrived
-    # untested. Printing the number never caught that; failing on it does.
-    - name: Coverage gate
-      run: ./scripts/coverage-gate.sh coverage.out 100
+    # Tests under -race plus the 100% gate. The suite covers every statement, so
+    # a drop means a new branch arrived untested; failing on it is the point.
+    - name: Test and coverage gate
+      run: mise run coverage
 
   lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-    - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
       with:
-        go-version-file: go.mod
+        persist-credentials: false
 
+    - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+      with:
+        version: 2026.10.1
+        cache_key: "{{default}}-${{ hashFiles('go.mod') }}"
+
+    # .editorconfig, the shell scripts, and the workflows: the conventions
+    # golangci-lint does not see.
+    - name: Check conventions
+      run: mise run check
+
+    # install-mode: none runs the golangci-lint mise installed, so its version
+    # lives only in mise.toml; the action still annotates PRs and caches analysis.
     - name: Lint
       uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
       with:
-        version: v2.15.0
+        install-mode: none
         # --fix=false overrides `issues.fix: true` in .golangci.yml. Without it
         # CI would rewrite the checkout and then lint its own output.
-        args: --timeout 5m --fix=false
+        args: --fix=false

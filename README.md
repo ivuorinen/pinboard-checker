@@ -274,24 +274,34 @@ runs can be diffed against each other.
 
 ### Requirements
 
-- Go — see the `go` directive in [`go.mod`](go.mod)
+[mise](https://mise.jdx.dev/) installs every tool at the version CI uses:
+
+```bash
+mise install
+```
+
+Go comes from the `toolchain` line in [`go.mod`](go.mod); golangci-lint,
+GoReleaser, cosign, syft, editorconfig-checker, shellcheck, actionlint and zizmor
+are pinned in [`mise.toml`](mise.toml).
 
 ### Building
 
 ```bash
-go build -o pinboard-checker
+mise run build
 ```
 
 ### Testing
 
 ```bash
-go test -race ./...
-golangci-lint run
-just coverage        # tests + the 100% gate + the HTML report
+mise run test        # go test -race ./...
+mise run lint        # golangci-lint run
+mise run coverage    # tests + the 100% gate + the HTML report
+mise run check       # .editorconfig, shellcheck, actionlint, zizmor
 ```
 
-All three are enforced in CI. The suite uses local `httptest` servers only and
-needs no network access.
+All four are enforced in CI, `test` through `coverage`. CI lints without applying
+fixes, so commit what `mise run lint` rewrites. `mise tasks` lists the rest. The
+suite uses local `httptest` servers only and needs no network access.
 
 ### Coverage
 
@@ -314,14 +324,15 @@ code that is merely awkward to reach — treat a new one as a claim to verify.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your change, keeping `go test -race ./...` and `golangci-lint run` green
+3. Make your change, keeping `mise run coverage` (tests under `-race` plus the
+   100% gate), `mise run lint` and `mise run check` green
 4. Commit using [Conventional Commits](https://www.conventionalcommits.org/)
    (`fix:`, `feat:`, `docs:`, `chore:`, `ci:`, …), as the existing history does
 5. Push to the branch (`git push origin feature/amazing-feature`)
 6. Open a Pull Request
 
-CI runs the build, the test suite under `-race`, and `golangci-lint`. All three
-must pass.
+CI runs the build, the test suite under `-race` with the 100% coverage gate,
+`golangci-lint`, and `mise run check`. All of them must pass.
 
 ## API Rate Limiting
 

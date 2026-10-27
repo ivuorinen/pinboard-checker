@@ -177,6 +177,6 @@ func TestREADME_HasNoRetiredClaims(t *testing.T) {
 
 	// A hardcoded Go version reintroduces the drift the go.mod pointer removed.
 	if strings.Contains(readme, "Go 1.2") {
-		t.Error("README hardcodes a Go version; point at the go directive in go.mod instead")
+		t.Error("README hardcodes a Go version; point at the toolchain line in go.mod instead")
 	}
 }

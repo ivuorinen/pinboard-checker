@@ -4,3 +4,4 @@ pinboard-checker
 dist/
 coverage.html
 THIRD_PARTY_NOTICES.md
+mise.lock
