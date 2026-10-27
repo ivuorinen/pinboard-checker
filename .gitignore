@@ -3,3 +3,4 @@ pinboard-checker
 *.out
 dist/
 coverage.html
+THIRD_PARTY_NOTICES.md
