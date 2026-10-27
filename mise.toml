@@ -11,7 +11,7 @@ golangci-lint = "2.15.0"
 goreleaser = "2.18.3"
 # goreleaser shells out to these in the release workflow: `signs.cmd: cosign`
 # and the `sboms` block (syft).
-cosign = "2.6.5"
+cosign = "3.1.4"
 syft = "1.55.0"
 # The `check` task: the repo's conventions golangci-lint does not cover.
 editorconfig-checker = "4.0.2"
