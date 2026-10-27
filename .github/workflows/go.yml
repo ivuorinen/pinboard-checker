@@ -34,7 +34,7 @@ jobs:
       with:
         # mise itself; unset, each run installs the newest release. Renovate
         # bumps it as the jdx/mise dependency.
-        version: 2026.10.1
+        version: 2026.10.19
         cache_key: "{{default}}-${{ hashFiles('go.mod') }}"
 
     # mise-action caches only mise's directory, not Go's build and module caches.
@@ -67,7 +67,7 @@ jobs:
 
     - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
       with:
-        version: 2026.10.1
+        version: 2026.10.19
         cache_key: "{{default}}-${{ hashFiles('go.mod') }}"
 
     # .editorconfig, the shell scripts, and the workflows: the conventions

@@ -36,7 +36,7 @@ jobs:
           # mise itself. Unset, every tag would run whatever release is newest,
           # holding this job's write token and signing identity. Renovate bumps
           # it as the jdx/mise dependency.
-          version: 2026.10.1
+          version: 2026.10.19
           # A restored tool cache is trusted as-is; release builds must not trust
           # a cache poisonable from lower-privilege runs.
           cache: false
