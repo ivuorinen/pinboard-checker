@@ -83,14 +83,16 @@ func TestFollowRedirects_RejectsNonHTTPRedirect(t *testing.T) {
 	}
 }
 
-// When a host refuses HEAD and the GET retry also fails, the HEAD status stands
-// rather than the failure being swallowed into a success.
+// When a host refuses HEAD and the GET retry also fails, the HEAD status and
+// host stand rather than the failure being swallowed into a success.
 func TestConfirmWithGet_KeepsHeadStatusWhenGetFails(t *testing.T) {
 	t.Parallel()
 
-	got := newTestChecker(t).confirmWithGet(unreachableURL(t), http.StatusForbidden)
-	if got != http.StatusForbidden {
-		t.Errorf("confirmWithGet() = %d, want the original HEAD status", got)
+	const headHost = "head.example"
+
+	got, host := newTestChecker(t).confirmWithGet(unreachableURL(t), http.StatusForbidden, headHost)
+	if got != http.StatusForbidden || host != headHost {
+		t.Errorf("confirmWithGet() = %d, %q; want the original HEAD status and host", got, host)
 	}
 }
 
@@ -117,7 +119,7 @@ func TestConfirmWithGet_RefusesRedirectToNonPublicHost(t *testing.T) {
 	chk := newTestChecker(t)
 	chk.isPublicHost = func(rawURL string) bool { return !strings.HasPrefix(rawURL, private.URL) }
 
-	got := chk.confirmWithGet(public.URL+"/page", http.StatusForbidden)
+	got, _ := chk.confirmWithGet(public.URL+"/page", http.StatusForbidden, "")
 	if got != http.StatusForbidden {
 		t.Errorf("confirmWithGet() = %d, want the HEAD status %d", got, http.StatusForbidden)
 	}
@@ -142,7 +144,7 @@ func TestConfirmWithGet_StopsAtHopLimit(t *testing.T) {
 		}))
 	t.Cleanup(server.Close)
 
-	got := newTestChecker(t).confirmWithGet(server.URL, http.StatusForbidden)
+	got, _ := newTestChecker(t).confirmWithGet(server.URL, http.StatusForbidden, "")
 	if got != http.StatusFound {
 		t.Errorf("confirmWithGet() = %d, want the last redirect's %d", got, http.StatusFound)
 	}
@@ -191,6 +193,41 @@ func TestCheckURL_NotFoundFromMaskingHostIsUnverifiable(t *testing.T) {
 	}
 	if chk.stats.Skipped != 1 {
 		t.Errorf("Skipped = %d, want 1", chk.stats.Skipped)
+	}
+}
+
+// A short link refuses HEAD, and the GET re-check follows its redirect to a
+// host that answers 404 for private resources. The 404 belongs to that host,
+// so the exception must test it, not the host that refused HEAD: a short link
+// to a private GitHub repository was deleted. The masking host is the same
+// server reached as localhost, so the two hosts differ by name.
+func TestCheckURL_NotFoundBehindGETRedirectToMaskingHost(t *testing.T) {
+	t.Parallel()
+
+	masking, err := url.Parse(staticServer(t, http.StatusNotFound, "").URL)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	masking.Host = "localhost:" + masking.Port()
+	masking.Path = "/org/private-repo"
+
+	short := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+
+				return
+			}
+			http.Redirect(w, r, masking.String(), http.StatusFound)
+		}))
+	t.Cleanup(short.Close)
+
+	chk := newTestChecker(t)
+	chk.notFoundMasksPrivate = map[string]bool{"localhost": true}
+
+	_, _, err = chk.checkURL(short.URL, "test context")
+	if !errors.Is(err, errUnverifiable) || errors.Is(err, errDeadLink) {
+		t.Errorf("checkURL() error = %v, want errUnverifiable for the masking host's 404", err)
 	}
 }
 

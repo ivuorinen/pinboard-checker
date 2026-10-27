@@ -1810,13 +1810,13 @@ func (c *checker) checkURL(urlString, context string) (string, bool, error) {
 	defer c.closeBody(resp.Body)
 
 	status := resp.StatusCode
+	host := strings.ToLower(resp.Request.URL.Hostname())
 	if status == http.StatusForbidden || status == http.StatusMethodNotAllowed {
-		status = c.confirmWithGet(urlString, status)
+		status, host = c.confirmWithGet(urlString, status, host)
 	}
 
 	c.stats.RecordHTTPStatus(opURLValidation, status)
 
-	host := strings.ToLower(resp.Request.URL.Hostname())
 	if status == http.StatusNotFound && c.notFoundMasksPrivate[host] {
 		return "", false, fmt.Errorf("%w: %s returns 404 from %s, which answers 404 "+
 			"for private resources", errUnverifiable, context, host)
@@ -1878,17 +1878,23 @@ func isPermanentRedirect(status int) bool {
 }
 
 // confirmWithGet re-requests a URL that refused HEAD, returning the GET status
-// when one is obtained and the original status otherwise.
-func (c *checker) confirmWithGet(urlString string, headStatus int) int {
+// and the host that answered it when one is obtained, and the HEAD status and
+// host otherwise.
+//
+// The GET follows redirects, so its status can come from another host. The
+// notFoundMasksPrivate check needs that host: tested against the host that
+// refused HEAD, a short link whose GET redirected to a private GitHub
+// repository got GitHub's 404 attributed to the shortener, and was deleted.
+func (c *checker) confirmWithGet(urlString string, headStatus int, headHost string) (int, string) {
 	c.hosts.wait(urlString)
 
 	resp, err := c.client.Get(urlString)
 	if err != nil {
-		return headStatus
+		return headStatus, headHost
 	}
 	defer c.closeBody(resp.Body)
 
-	return resp.StatusCode
+	return resp.StatusCode, strings.ToLower(resp.Request.URL.Hostname())
 }
 
 // fixParenthesesSuffix drops a trailing ")" when the URL works without it,
