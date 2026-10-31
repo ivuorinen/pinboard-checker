@@ -76,12 +76,13 @@ run = "goreleaser release --clean --snapshot --skip=sign"
 # carries the commits it points at, and the main ruleset does not cover tags, so
 # tagging unpushed work would publish it without a PR. Untracked files count as
 # unclean: an untracked .svu.yml or mise.local.toml changes the version svu picks
-# or this task itself. --v0 keeps a breaking change to a minor bump while the
-# version is 0.x.
+# or this task itself. A failing git status stops it too: errexit does not reach
+# a command substitution inside [ ], so its exit status is tested explicitly.
+# --v0 keeps a breaking change to a minor bump while the version is 0.x.
 [tasks.release]
 description = "Tag the next version and push it; the release workflow publishes it"
 run = '''
-if [ -n "$(git status --porcelain)" ]; then
+if ! status=$(git status --porcelain) || [ -n "$status" ]; then
   echo "Error: working tree is not clean" >&2
   exit 1
 fi
