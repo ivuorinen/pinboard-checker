@@ -74,12 +74,14 @@ run = "goreleaser release --clean --snapshot --skip=sign"
 # Pushing the tag is the release: the release workflow builds, signs and
 # publishes it with release-publish. HEAD must be exactly origin/main. A tag
 # carries the commits it points at, and the main ruleset does not cover tags, so
-# tagging unpushed work would publish it without a PR. --v0 keeps a breaking
-# change to a minor bump while the version is 0.x.
+# tagging unpushed work would publish it without a PR. Untracked files count as
+# unclean: an untracked .svu.yml or mise.local.toml changes the version svu picks
+# or this task itself. --v0 keeps a breaking change to a minor bump while the
+# version is 0.x.
 [tasks.release]
 description = "Tag the next version and push it; the release workflow publishes it"
 run = '''
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if [ -n "$(git status --porcelain)" ]; then
   echo "Error: working tree is not clean" >&2
   exit 1
 fi
