@@ -324,7 +324,8 @@ code that is merely awkward to reach — treat a new one as a claim to verify.
 ### Releasing
 
 Releases use [Semantic Versioning](https://semver.org/) tags (`v0.2.0`), the
-only version form `go install` understands.
+only tags `go install ...@latest` resolves to; Go reads any other tag as a
+plain commit.
 
 ```bash
 mise run snapshot    # build the release into dist/ without publishing it
