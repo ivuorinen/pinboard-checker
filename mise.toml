@@ -13,6 +13,8 @@ goreleaser = "2.19.0"
 # and the `sboms` block (syft).
 cosign = "2.6.5"
 syft = "1.55.0"
+# The `release` task: the next version from the Conventional Commits history.
+svu = "3.4.1"
 # The `check` task: the repo's conventions golangci-lint does not cover.
 editorconfig-checker = "4.0.2"
 shellcheck = "0.11.0"
@@ -65,9 +67,40 @@ run = "go build -o pinboard-checker ."
 
 # --skip=sign: keyless cosign outside CI opens a browser login and records the
 # signer's email in the public Rekor log, for an artifact nobody downloads.
-[tasks.release]
+[tasks.snapshot]
 description = "Build a snapshot release into dist/ (no publish, no signing)"
 run = "goreleaser release --clean --snapshot --skip=sign"
+
+# Pushing the tag is the release: the release workflow builds, signs and
+# publishes it with release-publish. HEAD must be exactly origin/main. A tag
+# carries the commits it points at, and the main ruleset does not cover tags, so
+# tagging unpushed work would publish it without a PR. Untracked files count as
+# unclean: an untracked .svu.yml or mise.local.toml changes the version svu picks
+# or this task itself. A failing git status stops it too: errexit does not reach
+# a command substitution inside [ ], so its exit status is tested explicitly.
+# --v0 keeps a breaking change to a minor bump while the version is 0.x.
+[tasks.release]
+description = "Tag the next version and push it; the release workflow publishes it"
+run = '''
+if ! status=$(git status --porcelain) || [ -n "$status" ]; then
+  echo "Error: working tree is not clean" >&2
+  exit 1
+fi
+if [ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then
+  echo "Error: not on main branch" >&2
+  exit 1
+fi
+git fetch --quiet --tags origin main
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  echo "Error: main is not the same commit as origin/main" >&2
+  exit 1
+fi
+tag=$(svu next --v0)
+echo "Releasing $tag..."
+git tag -a "$tag" -m "Release $tag"
+git push origin "$tag"
+echo "Tag $tag pushed. GitHub Actions will build, sign and publish the release."
+'''
 
 [tasks.release-publish]
 description = "Publish a release; run by the release workflow (needs GITHUB_TOKEN, OIDC)"

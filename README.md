@@ -282,8 +282,8 @@ mise install
 ```
 
 Go comes from the `toolchain` line in [`go.mod`](go.mod); golangci-lint,
-GoReleaser, cosign, syft, editorconfig-checker, shellcheck, actionlint and zizmor
-are pinned in [`mise.toml`](mise.toml).
+GoReleaser, cosign, syft, svu, editorconfig-checker, shellcheck, actionlint and
+zizmor are pinned in [`mise.toml`](mise.toml).
 
 ### Building
 
@@ -320,6 +320,24 @@ if err != nil {
 There are none today. A marker is for code that *cannot* run, never for
 code that is merely awkward to reach — treat a new one as a claim to verify.
 `scripts/coverage-gate.sh` implements the rule and reports what it excluded.
+
+### Releasing
+
+Releases use [Semantic Versioning](https://semver.org/) tags (`v0.2.0`), the
+only tags `go install ...@latest` resolves to; Go reads any other tag as a
+plain commit.
+
+```bash
+mise run snapshot    # build the release into dist/ without publishing it
+mise run release     # tag the next version and push the tag
+```
+
+`release` runs only on a clean `main` that is the same commit as
+`origin/main`. [svu](https://github.com/caarlos0/svu) picks the next version
+from the Conventional Commits since the last tag: `fix:` bumps the patch,
+`feat:` the minor, and a breaking change the minor while the version is 0.x.
+The pushed tag starts the Release workflow, which builds, signs and publishes
+the GitHub release with GoReleaser.
 
 ### Contributing
 
