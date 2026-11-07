@@ -19,7 +19,7 @@ svu = "3.4.1"
 editorconfig-checker = "4.0.2"
 shellcheck = "0.11.0"
 actionlint = "1.7.12"
-zizmor = "1.31.1"
+zizmor = "1.32.0"
 
 [settings]
 # Take the Go version from go.mod. mise reads `toolchain goX.Y.Z` as an exact
