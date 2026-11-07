@@ -14,7 +14,7 @@ goreleaser = "2.19.0"
 cosign = "2.6.5"
 syft = "1.56.0"
 # The `release` task: the next version from the Conventional Commits history.
-svu = "3.4.1"
+svu = "3.4.4"
 # The `check` task: the repo's conventions golangci-lint does not cover.
 editorconfig-checker = "4.0.2"
 shellcheck = "0.11.0"
