@@ -12,7 +12,7 @@ goreleaser = "2.20.0"
 # goreleaser shells out to these in the release workflow: `signs.cmd: cosign`
 # and the `sboms` block (syft).
 cosign = "2.6.5"
-syft = "1.57.0"
+syft = "1.57.1"
 # The `release` task: the next version from the Conventional Commits history.
 svu = "3.4.4"
 # The `check` task: the repo's conventions golangci-lint does not cover.
