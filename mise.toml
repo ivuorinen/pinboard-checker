@@ -8,7 +8,7 @@
 
 [tools]
 golangci-lint = "2.15.0"
-goreleaser = "2.20.0"
+goreleaser = "2.20.1"
 # goreleaser shells out to these in the release workflow: `signs.cmd: cosign`
 # and the `sboms` block (syft).
 cosign = "2.6.5"
