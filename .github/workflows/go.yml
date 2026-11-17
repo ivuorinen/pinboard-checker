@@ -30,7 +30,7 @@ jobs:
     # Installs the tools in mise.toml; Go comes from go.mod's toolchain line. The
     # default cache key hashes only mise's own files, and an exact hit is never
     # re-saved, so go.mod joins the key or a toolchain bump is downloaded forever.
-    - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+    - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
       with:
         # mise itself; unset, each run installs the newest release. Renovate
         # bumps it as the jdx/mise dependency.
@@ -65,7 +65,7 @@ jobs:
       with:
         persist-credentials: false
 
-    - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+    - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
       with:
         version: 2026.10.25
         cache_key: "{{default}}-${{ hashFiles('go.mod') }}"
